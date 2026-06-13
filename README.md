@@ -41,7 +41,7 @@ git clone https://github.com/zxc779177631-ui/expression-spark.git \
 
 ### 使用 `.skill` 安装包
 
-从 GitHub Releases 下载 `expression-spark.skill`，再使用运行时提供的 Skill 导入能力安装。
+从仓库的 [`packages/expression-spark.skill`](packages/expression-spark.skill) 下载，再使用运行时提供的 Skill 导入能力安装。
 
 ## 如何触发
 
@@ -175,4 +175,3 @@ expression-spark/
 ├── scripts/library.py
 └── tests/test_library.py
 ```
-

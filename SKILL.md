@@ -18,6 +18,7 @@ description: |
 - 原话是源数据；选题卡、画像和 Persona 都是可以重建的派生层。
 - 单次随口表达只能成为 `tentative` 信号，不能直接定义成用户的长期价值观。
 - 短小、多段的表达会话是正常形态，不要求用户一次说出完整内容；后续再跨会话归并主题和证据。
+- 纯路径操作、权限排障、安装命令、凭证和无关任务对话不进入表达资产库；除非用户明确把其中的经历或判断作为内容素材来聊。
 
 ## 入口分流
 
@@ -203,7 +204,14 @@ python3 "$LIBRARY_TOOL" status --library "<资产库路径>"
 
 用户要把试用成果或问题回传给维护者时，读取 [references/feedback-export.md](references/feedback-export.md)。
 
-先导出不含正文的成果快照：
+先确认正在使用支持反馈导出的新版：
+
+```bash
+python3 "$LIBRARY_TOOL" version
+python3 "$LIBRARY_TOOL" feedback --help
+```
+
+再导出不含正文的成果快照：
 
 ```bash
 python3 "$LIBRARY_TOOL" feedback \

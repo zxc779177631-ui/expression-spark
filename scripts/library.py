@@ -21,6 +21,7 @@ from typing import Any, Iterable
 SCHEMA_VERSION = 1
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 ASSETS_DIR = SKILL_ROOT / "assets"
+VERSION_FILE = SKILL_ROOT / "VERSION"
 SIGNAL_STATUSES = {"tentative", "recurring", "confirmed", "contradicted", "retired"}
 SIGNAL_TYPES = {"voice", "value", "stance", "boundary", "tension", "business"}
 MODES = {"deep-interviewer", "gentle-journal", "content-coach"}
@@ -43,6 +44,13 @@ SENSITIVE_PATTERNS = (
 
 class LibraryError(RuntimeError):
     """Expected validation or usage error."""
+
+
+def skill_version() -> str:
+    try:
+        return VERSION_FILE.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return "unknown"
 
 
 def iso_now() -> str:
@@ -1000,6 +1008,11 @@ def cmd_context(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_version(_: argparse.Namespace) -> int:
+    print(skill_version())
+    return 0
+
+
 def percentage(numerator: int, denominator: int) -> str:
     if denominator == 0:
         return "0%"
@@ -1090,6 +1103,7 @@ def feedback_markdown(
     chunks = [
         "# Expression Spark 试用成果快照",
         "",
+        f"- Skill 版本：{skill_version()}",
         f"- 生成时间：{iso_now()}",
         f"- 资产库：`{store.root}`",
         f"- 导出模式：{'包含已确认资产正文' if include_content else '仅统计与索引'}",
@@ -1142,10 +1156,11 @@ def feedback_markdown(
         "",
         "## 交互反馈待补充",
         "",
-        "- 用户确认的个性化表达触发器：待 Agent 从试用对话补充",
-        "- 可泛化的产品发现：待 Agent 与个性偏好分开补充",
-        "- 有效提问样本：待补充 2–5 组",
-        "- 无效提问或用户纠正：待补充 2–5 组",
+        "- 用户确认的个性化表达触发器：待 Agent 从实际试用对话补充，并标注来源会话",
+        "- 产品工作流偏好：待补充，不能混入个人表达画像",
+        "- 可泛化的产品发现：待 Agent 与个性偏好分开补充，并说明验证范围",
+        "- 有效提问样本：待补充 2–5 组真实问答，不能复制 Skill 示例",
+        "- 无效提问或用户纠正：待补充 2–5 组真实问答",
         "- 运行环境或工具错误：待补充，必须与 Skill 设计问题分开",
         "",
         "> 将本报告交给维护者前，按 `references/feedback-export.md` 补充交互反馈并再次检查隐私。",
@@ -1474,6 +1489,9 @@ def cmd_forget(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    version_parser = subparsers.add_parser("version", help="show the installed Expression Spark version")
+    version_parser.set_defaults(func=cmd_version)
 
     init_parser = subparsers.add_parser("init", help="initialize a user evidence library")
     init_parser.add_argument("--user-slug", required=True)

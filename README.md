@@ -127,6 +127,9 @@ python3 scripts/library.py --help
 主要命令：
 
 ```bash
+# 确认当前安装版本
+python3 scripts/library.py version
+
 # 初始化资产库
 python3 scripts/library.py init --user-slug jia-run --name 嘉润
 

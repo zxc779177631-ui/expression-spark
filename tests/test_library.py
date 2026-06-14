@@ -142,6 +142,11 @@ class LibraryCliTest(unittest.TestCase):
             self.assertNotIn(forbidden, state_text)
         self.assertIn("不保存完整聊天记录", (self.root / "config.md").read_text(encoding="utf-8"))
 
+    def test_version_is_available_without_a_library(self) -> None:
+        result = self.run_cli("version")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), (SKILL_ROOT / "VERSION").read_text(encoding="utf-8").strip())
+
     def test_register_rejects_unconfirmed_payload(self) -> None:
         payload = self.payload(1)
         payload["confirmed"] = False
@@ -279,6 +284,7 @@ class LibraryCliTest(unittest.TestCase):
         metadata = self.run_cli("feedback", "--library", str(self.root))
         self.assertEqual(metadata.returncode, 0, metadata.stderr)
         self.assertIn("仅统计与索引", metadata.stdout)
+        self.assertIn("Skill 版本：", metadata.stdout)
         self.assertIn("短小、多段会话是允许的真实表达形态", metadata.stdout)
         self.assertNotIn("这是一条确认原话", metadata.stdout)
         content = self.run_cli(

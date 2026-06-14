@@ -78,7 +78,7 @@ git clone https://github.com/zxc779177631-ui/expression-spark.git \
 首次会话会：
 
 1. 询问称呼、当前业务和常聊领域。
-2. 选择默认采访模式。
+2. 默认从低压力采访开始，Agent 根据表达状态适配；用户也可以明确指定模式。
 3. 告知资产存储位置和隐私规则。
 4. 创建个人表达资产库。
 
@@ -141,6 +141,9 @@ python3 scripts/library.py context --library "<资产库路径>" --query "客户
 
 # 检查证据引用与状态一致性
 python3 scripts/library.py validate --library "<资产库路径>"
+
+# 导出默认不含语料正文的试用成果快照
+python3 scripts/library.py feedback --library "<资产库路径>" --output outcomes.md
 
 # 先预览遗忘影响，确认后再应用
 python3 scripts/library.py forget --library "<资产库路径>" --contains "前合伙人" --dry-run

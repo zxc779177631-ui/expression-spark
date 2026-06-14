@@ -272,6 +272,28 @@ class LibraryCliTest(unittest.TestCase):
         self.assertIn("Source sessions with exact quotes", context.stdout)
         self.assertIn("不是所有给钱多的客户都值得接", context.stdout)
 
+    def test_feedback_export_separates_metadata_from_confirmed_content(self) -> None:
+        payload = self.payload(1)
+        payload["quotes"][0]["text"] = "这是一条确认原话，api_key=should-not-leak-123456。"
+        self.assertEqual(self.register(payload, "feedback-source.json").returncode, 0)
+        metadata = self.run_cli("feedback", "--library", str(self.root))
+        self.assertEqual(metadata.returncode, 0, metadata.stderr)
+        self.assertIn("仅统计与索引", metadata.stdout)
+        self.assertIn("短小、多段会话是允许的真实表达形态", metadata.stdout)
+        self.assertNotIn("这是一条确认原话", metadata.stdout)
+        content = self.run_cli(
+            "feedback",
+            "--library",
+            str(self.root),
+            "--include-content",
+            "--session-limit",
+            "1",
+        )
+        self.assertEqual(content.returncode, 0, content.stderr)
+        self.assertIn("这是一条确认原话", content.stdout)
+        self.assertNotIn("should-not-leak-123456", content.stdout)
+        self.assertIn("api_key=[REDACTED]", content.stdout)
+
     def test_forget_requires_preview_then_rebuilds(self) -> None:
         payload = self.payload(1, include_core_signals=True)
         result = self.register(payload, "forget-source.json")

@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import uuid
+from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -30,6 +31,13 @@ STATE_CONTENT_KEYS = {"text", "claim", "summary", "fact_core", "tension", "audie
 QUOTE_BLOCK_RE = re.compile(
     r"<!-- quote:(?P<id>[^:]+):start -->.*?<!-- quote:(?P=id):end -->\n?",
     re.DOTALL,
+)
+SENSITIVE_PATTERNS = (
+    re.compile(
+        r"(?i)\b(app[_ -]?secret|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|password)"
+        r"(\s*[:=]\s*)([^\s`\"'<>]{6,})"
+    ),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{12,}"),
 )
 
 
@@ -64,6 +72,24 @@ def parse_csv(value: str | None) -> list[str]:
 
 def dump_json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+
+
+def redact_sensitive(text: str) -> tuple[str, int]:
+    redactions = 0
+
+    def replace_assignment(match: re.Match[str]) -> str:
+        nonlocal redactions
+        redactions += 1
+        return f"{match.group(1)}{match.group(2)}[REDACTED]"
+
+    text = SENSITIVE_PATTERNS[0].sub(replace_assignment, text)
+
+    def replace_bearer(_: re.Match[str]) -> str:
+        nonlocal redactions
+        redactions += 1
+        return "Bearer [REDACTED]"
+
+    return SENSITIVE_PATTERNS[1].sub(replace_bearer, text), redactions
 
 
 def load_json(path: Path) -> Any:
@@ -974,6 +1000,206 @@ def cmd_context(args: argparse.Namespace) -> int:
     return 0
 
 
+def percentage(numerator: int, denominator: int) -> str:
+    if denominator == 0:
+        return "0%"
+    return f"{round(numerator / denominator * 100)}%"
+
+
+def median(values: list[int]) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return float(ordered[middle])
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def markdown_asset_section(
+    store: LibraryStore,
+    records: Iterable[dict[str, Any]],
+) -> tuple[str, int]:
+    chunks = []
+    redactions = 0
+    for record in records:
+        try:
+            text = store.read_text(record["path"]).strip()
+        except FileNotFoundError:
+            continue
+        text, count = redact_sensitive(text)
+        redactions += count
+        chunks.append(text)
+    return "\n\n---\n\n".join(chunks) or "- 无", redactions
+
+
+def feedback_markdown(
+    store: LibraryStore,
+    state: dict[str, Any],
+    include_content: bool,
+    session_limit: int,
+) -> str:
+    records = state["records"]
+    sessions = sorted(
+        records["sessions"].values(),
+        key=lambda record: (record.get("date", ""), record.get("id", "")),
+    )
+    topics = sorted(records["topics"].values(), key=lambda record: record["id"])
+    signals = sorted(records["signals"].values(), key=lambda record: record["id"])
+    quote_counts = [len(record.get("quote_ids", [])) for record in sessions]
+    small_sessions = [record for record in sessions if len(record.get("quote_ids", [])) <= 3]
+    sessions_with_topics = [record for record in sessions if record.get("topic_ids")]
+    sessions_with_signals = [record for record in sessions if record.get("signal_ids")]
+    sessions_without_derivatives = [
+        record for record in sessions if not record.get("topic_ids") and not record.get("signal_ids")
+    ]
+    sessions_per_day = Counter(record.get("date", "unknown") for record in sessions)
+    theme_sessions: dict[str, set[str]] = {}
+    for record in sessions:
+        for theme in record.get("themes", []):
+            theme_sessions.setdefault(theme, set()).add(record["id"])
+    repeat_themes = sorted(
+        ((theme, len(session_ids)) for theme, session_ids in theme_sessions.items() if len(session_ids) >= 2),
+        key=lambda item: (-item[1], item[0]),
+    )
+    stats = compute_stats(state)
+    validation = validation_report(store, state)
+    average_quotes = sum(quote_counts) / len(quote_counts) if quote_counts else 0
+    inventory = []
+    for record in sessions:
+        inventory.append(
+            "- "
+            f"`{record['id']}` · {record.get('date', 'unknown')} · {record.get('mode', 'unknown')} · "
+            f"{len(record.get('quote_ids', []))} 原话 · {len(record.get('topic_ids', []))} 选题 · "
+            f"{len(record.get('signal_ids', []))} 信号 · `{record['path']}`"
+        )
+    topic_inventory = [
+        f"- `{record['id']}` · {record.get('status', 'unknown')} · {record.get('theme') or '无主题'} · "
+        f"{len(record.get('quote_ids', []))} 条证据 · `{record['path']}`"
+        for record in topics
+    ]
+    signal_inventory = [
+        f"- `{record['id']}` · {record.get('type', 'unknown')}/{record.get('status', 'unknown')} · "
+        f"{len(record.get('evidence_session_ids', []))} 次会话证据 · `{record['path']}`"
+        for record in signals
+    ]
+    checks = "\n".join(
+        f"- {name}: {'ready' if ready else 'not ready'}"
+        for name, ready in stats["stable_persona"]["checks"].items()
+    )
+    chunks = [
+        "# Expression Spark 试用成果快照",
+        "",
+        f"- 生成时间：{iso_now()}",
+        f"- 资产库：`{store.root}`",
+        f"- 导出模式：{'包含已确认资产正文' if include_content else '仅统计与索引'}",
+        f"- 校验：{'PASS' if validation['ok'] else 'FAIL'}",
+        "",
+        "> 本报告不读取或导出完整聊天记录。短小、多段会话是允许的真实表达形态；重点观察它们后续是否形成重复主题、选题或画像证据。",
+        "",
+        "## 成果总览",
+        "",
+        f"- 会话：{stats['sessions']}",
+        f"- 精选原话：{stats['quotes']}",
+        f"- 轻量选题卡：{stats['topics']}",
+        f"- 画像信号：{stats['signals']}",
+        f"- 覆盖主题：{len(stats['themes'])}",
+        f"- 具体故事或决策：{stats['stories_or_decisions']}",
+        "",
+        "## 对话形态",
+        "",
+        f"- 每次会话平均原话数：{average_quotes:.1f}",
+        f"- 每次会话原话数中位数：{median(quote_counts):g}",
+        f"- 短会话（≤3 条原话）：{len(small_sessions)} / {len(sessions)}",
+        f"- 每日会话数：{', '.join(f'{day}={count}' for day, count in sorted(sessions_per_day.items())) or '无'}",
+        "",
+        "## 提炼覆盖",
+        "",
+        f"- 已形成选题的会话：{len(sessions_with_topics)} / {len(sessions)}（{percentage(len(sessions_with_topics), len(sessions))}）",
+        f"- 已形成画像信号的会话：{len(sessions_with_signals)} / {len(sessions)}（{percentage(len(sessions_with_signals), len(sessions))}）",
+        f"- 尚未形成选题或信号的会话：{len(sessions_without_derivatives)}",
+        f"- 跨会话重复主题：{', '.join(f'{theme}({count})' for theme, count in repeat_themes) or '无'}",
+        "",
+        "### 可供周期性归并的会话",
+        "",
+        format_list(record["id"] for record in sessions_without_derivatives),
+        "",
+        "## Persona 准备度",
+        "",
+        checks,
+        "",
+        "## 会话索引",
+        "",
+        "\n".join(inventory) or "- 无",
+        "",
+        "## 选题索引",
+        "",
+        "\n".join(topic_inventory) or "- 无",
+        "",
+        "## 信号索引",
+        "",
+        "\n".join(signal_inventory) or "- 无",
+        "",
+        "## 交互反馈待补充",
+        "",
+        "- 用户确认的个性化表达触发器：待 Agent 从试用对话补充",
+        "- 可泛化的产品发现：待 Agent 与个性偏好分开补充",
+        "- 有效提问样本：待补充 2–5 组",
+        "- 无效提问或用户纠正：待补充 2–5 组",
+        "- 运行环境或工具错误：待补充，必须与 Skill 设计问题分开",
+        "",
+        "> 将本报告交给维护者前，按 `references/feedback-export.md` 补充交互反馈并再次检查隐私。",
+    ]
+    redactions = 0
+    if include_content:
+        profile, count = redact_sensitive(store.read_text("profile/current.md").strip())
+        redactions += count
+        topic_content, count = markdown_asset_section(store, topics)
+        redactions += count
+        signal_content, count = markdown_asset_section(store, signals)
+        redactions += count
+        selected_sessions = list(reversed(sessions))[:session_limit]
+        selected_sessions.reverse()
+        session_content, count = markdown_asset_section(store, selected_sessions)
+        redactions += count
+        chunks.extend(
+            [
+                "",
+                "## 已确认画像正文",
+                "",
+                profile,
+                "",
+                "## 已确认选题卡正文",
+                "",
+                topic_content,
+                "",
+                "## 已确认画像信号正文",
+                "",
+                signal_content,
+                "",
+                f"## 最近 {len(selected_sessions)} 次会话的已确认资产",
+                "",
+                session_content,
+                "",
+                f"> 自动遮盖的疑似密钥或凭证：{redactions} 处。",
+            ]
+        )
+    return "\n".join(chunks).rstrip() + "\n"
+
+
+def cmd_feedback(args: argparse.Namespace) -> int:
+    store, state = load_store(args.library)
+    output = feedback_markdown(store, state, args.include_content, args.session_limit)
+    if args.output:
+        path = Path(args.output).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(output, encoding="utf-8")
+        print(dump_json({"ok": True, "output": str(path), "include_content": args.include_content}), end="")
+    else:
+        print(output, end="")
+    return 0
+
+
 def walk_keys(value: Any, path: str = "") -> Iterable[tuple[str, Any]]:
     if isinstance(value, dict):
         for key, item in value.items():
@@ -1282,6 +1508,13 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--json", action="store_true")
     validate_parser.set_defaults(func=cmd_validate)
 
+    feedback_parser = subparsers.add_parser("feedback", help="export a privacy-aware trial outcome snapshot")
+    feedback_parser.add_argument("--library", required=True)
+    feedback_parser.add_argument("--output")
+    feedback_parser.add_argument("--include-content", action="store_true")
+    feedback_parser.add_argument("--session-limit", type=int, default=12)
+    feedback_parser.set_defaults(func=cmd_feedback)
+
     forget_parser = subparsers.add_parser("forget", help="preview or apply a confirmed forget request")
     forget_parser.add_argument("--library", required=True)
     forget_parser.add_argument("--quote-id", action="append")
@@ -1299,6 +1532,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "feedback" and args.session_limit < 1:
+        parser.error("feedback --session-limit must be at least 1")
     if args.command == "forget" and not any(
         [args.quote_id, args.session_id, args.topic_id, args.signal_id, args.contains]
     ):

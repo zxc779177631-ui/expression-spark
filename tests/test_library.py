@@ -262,8 +262,14 @@ class LibraryCliTest(unittest.TestCase):
         stats = self.state()["stats"]
         self.assertTrue(stats["voice_preview"]["ready"])
         self.assertTrue(stats["stable_persona"]["ready"])
+        self.assertEqual(stats["voice_signals"], 3)
+        self.assertEqual(stats["voice_signal_statuses"]["recurring"], 3)
         self.assertEqual(stats["recurring_voice_patterns"], 3)
         self.assertGreaterEqual(stats["confirmed_values_or_stances"], 3)
+        status = self.run_cli("status", "--library", str(self.root))
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertIn("Voice signals: 3", status.stdout)
+        self.assertIn("recurring=3", status.stdout)
         context = self.run_cli(
             "context",
             "--library",
@@ -286,6 +292,7 @@ class LibraryCliTest(unittest.TestCase):
         self.assertIn("仅统计与索引", metadata.stdout)
         self.assertIn("Skill 版本：", metadata.stdout)
         self.assertIn("短小、多段会话是允许的真实表达形态", metadata.stdout)
+        self.assertIn("表达习惯提取：0 条 voice 信号", metadata.stdout)
         self.assertNotIn("这是一条确认原话", metadata.stdout)
         content = self.run_cli(
             "feedback",

@@ -525,6 +525,11 @@ def compute_stats(state: dict[str, Any]) -> dict[str, Any]:
     for session in sessions.values():
         themes.update(str(item).strip() for item in session.get("themes", []) if str(item).strip())
     story_count = sum(1 for quote in quotes.values() if quote.get("story_or_decision"))
+    voice_signals = [signal for signal in signals.values() if signal.get("type") == "voice"]
+    voice_signal_statuses = {
+        status: sum(1 for signal in voice_signals if signal.get("status") == status)
+        for status in sorted(SIGNAL_STATUSES)
+    }
     recurring_voice = sum(
         1
         for signal in signals.values()
@@ -575,6 +580,8 @@ def compute_stats(state: dict[str, Any]) -> dict[str, Any]:
         "signals": len(signals),
         "themes": sorted(themes),
         "stories_or_decisions": story_count,
+        "voice_signals": len(voice_signals),
+        "voice_signal_statuses": voice_signal_statuses,
         "recurring_voice_patterns": recurring_voice,
         "confirmed_values_or_stances": confirmed_values_stances,
         "confirmed_contradictions": confirmed_contradictions,
@@ -898,6 +905,7 @@ def status_markdown(store: LibraryStore, state: dict[str, Any]) -> str:
 - Signals: {stats['signals']}
 - Themes: {len(stats['themes'])}
 - Stories or decisions: {stats['stories_or_decisions']}
+- Voice signals: {stats['voice_signals']} ({', '.join(f"{status}={count}" for status, count in stats['voice_signal_statuses'].items() if count) or 'none'})
 - Recurring voice patterns: {stats['recurring_voice_patterns']}
 - Confirmed values or stances: {stats['confirmed_values_or_stances']}
 - Voice preview: {preview}
@@ -1144,6 +1152,10 @@ def feedback_markdown(
         format_list(record["id"] for record in sessions_without_derivatives),
         "",
         "## Persona 准备度",
+        "",
+        f"- 表达习惯提取：{stats['voice_signals']} 条 voice 信号（"
+        f"{', '.join(f'{status}={count}' for status, count in stats['voice_signal_statuses'].items() if count) or '无'}）",
+        f"- 跨会话重复表达模式：{stats['recurring_voice_patterns']}",
         "",
         checks,
         "",

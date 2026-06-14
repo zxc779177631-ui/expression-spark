@@ -233,6 +233,7 @@ def choose_init_store(args: argparse.Namespace) -> LibraryStore:
 def load_store(library: str) -> tuple[LibraryStore, dict[str, Any]]:
     root = Path(library).expanduser().resolve()
     state = load_json(root / "state.json")
+    state.setdefault("synthesis_batches", {})
     backend = state.get("settings", {}).get("backend", "filesystem")
     vault_root = detect_obsidian_vault() if backend == "obsidian" else None
     return LibraryStore(root, backend, vault_root), state
@@ -257,6 +258,7 @@ def new_state(slug: str, name: str, default_mode: str, backend: str) -> dict[str
         "user": {"slug": slug, "name": name},
         "settings": {"default_mode": default_mode, "backend": backend},
         "records": {"sessions": {}, "quotes": {}, "topics": {}, "signals": {}},
+        "synthesis_batches": {},
         "persona": {
             "last_generated_at": None,
             "last_generated_quote_count": 0,
@@ -726,7 +728,7 @@ def register_session(store: LibraryStore, state: dict[str, Any], payload: dict[s
                 "date": session["date"],
                 "theme": topic["theme"],
                 "status": topic["status"],
-                "session_id": session["id"],
+                "source_sessions_json": json.dumps([session["id"]], ensure_ascii=False),
                 "title": topic["title"],
                 "fact_core": topic["fact_core"] or "待补充",
                 "tension": topic["tension"] or "待补充",
@@ -741,6 +743,7 @@ def register_session(store: LibraryStore, state: dict[str, Any], payload: dict[s
             "path": topic_path,
             "status": topic["status"],
             "session_id": session["id"],
+            "source_session_ids": [session["id"]],
             "theme": topic["theme"],
             "quote_ids": topic["quote_ids"],
             "created_at": iso_now(),
@@ -870,6 +873,8 @@ def cmd_register(args: argparse.Namespace) -> int:
     if generation:
         apply_persona_generation(state, generation)
         result["persona_generation_registered"] = True
+    if payload.get("session"):
+        rebuild_session_derivative_links(store, state)
     update_stats(state)
     rebuild_profile(store, state)
     store.write_state(state)
@@ -1215,6 +1220,470 @@ def cmd_feedback(args: argparse.Namespace) -> int:
     return 0
 
 
+def session_ids_for_quotes(state: dict[str, Any], quote_ids: Iterable[str]) -> list[str]:
+    quotes = state["records"]["quotes"]
+    return sorted({quotes[quote_id]["session_id"] for quote_id in quote_ids if quote_id in quotes})
+
+
+def replace_markdown_list_section(text: str, heading: str, lines: Iterable[str]) -> str:
+    content = format_list(lines)
+    pattern = re.compile(
+        rf"(^## {re.escape(heading)}\s*$\n+)(.*?)(?=^## |\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+    if not pattern.search(text):
+        raise LibraryError(f"session file is missing section: {heading}")
+    return pattern.sub(lambda match: f"{match.group(1)}{content}\n\n", text, count=1)
+
+
+def rebuild_session_derivative_links(store: LibraryStore, state: dict[str, Any]) -> None:
+    records = state["records"]
+    topic_ids_by_session = {session_id: [] for session_id in records["sessions"]}
+    signal_ids_by_session = {session_id: [] for session_id in records["sessions"]}
+    for topic_id, topic in records["topics"].items():
+        source_session_ids = session_ids_for_quotes(state, topic.get("quote_ids", []))
+        topic["source_session_ids"] = source_session_ids
+        topic["session_id"] = source_session_ids[0] if len(source_session_ids) == 1 else None
+        for session_id in source_session_ids:
+            topic_ids_by_session[session_id].append(topic_id)
+    for signal_id, signal in records["signals"].items():
+        source_session_ids = session_ids_for_quotes(state, signal.get("evidence_quote_ids", []))
+        signal["evidence_session_ids"] = source_session_ids
+        for session_id in source_session_ids:
+            signal_ids_by_session[session_id].append(signal_id)
+    for session_id, session in records["sessions"].items():
+        topic_ids = sorted(topic_ids_by_session[session_id])
+        signal_ids = sorted(signal_ids_by_session[session_id])
+        text = store.read_text(session["path"])
+        text = replace_markdown_list_section(
+            text,
+            "本次生成的选题卡",
+            (f"[[topics/{topic_id}|{topic_id}]]" for topic_id in topic_ids),
+        )
+        text = replace_markdown_list_section(
+            text,
+            "本次画像信号",
+            (f"[[signals/{signal_id}|{signal_id}]]" for signal_id in signal_ids),
+        )
+        store.write_text(session["path"], text)
+        session["topic_ids"] = topic_ids
+        session["signal_ids"] = signal_ids
+
+
+def synthesis_candidate_sessions(state: dict[str, Any], limit: int) -> tuple[list[dict[str, Any]], list[str]]:
+    sessions = list(state["records"]["sessions"].values())
+    sessions.sort(key=lambda record: (record.get("date", ""), record.get("id", "")), reverse=True)
+    without_derivatives = [
+        record for record in sessions if not record.get("topic_ids") and not record.get("signal_ids")
+    ]
+    theme_sessions: dict[str, set[str]] = {}
+    for record in sessions:
+        for theme in record.get("themes", []):
+            theme_sessions.setdefault(theme, set()).add(record["id"])
+    repeated_themes = {theme for theme, session_ids in theme_sessions.items() if len(session_ids) >= 2}
+    related = [
+        record
+        for record in sessions
+        if record not in without_derivatives
+        and repeated_themes.intersection(record.get("themes", []))
+    ]
+    prioritized = without_derivatives + related
+    selected = prioritized[:limit]
+    selected.sort(key=lambda record: (record.get("date", ""), record.get("id", "")))
+    skipped = [record["id"] for record in prioritized[limit:]]
+    return selected, skipped
+
+
+def synthesis_context_markdown(
+    store: LibraryStore,
+    state: dict[str, Any],
+    session_limit: int,
+) -> str:
+    selected, skipped = synthesis_candidate_sessions(state, session_limit)
+    selected_themes = {
+        theme for record in selected for theme in record.get("themes", []) if str(theme).strip()
+    }
+    theme_sessions: dict[str, set[str]] = {}
+    for record in state["records"]["sessions"].values():
+        for theme in record.get("themes", []):
+            theme_sessions.setdefault(theme, set()).add(record["id"])
+    repeated_themes = sorted(
+        (
+            (theme, sorted(session_ids))
+            for theme, session_ids in theme_sessions.items()
+            if len(session_ids) >= 2 and theme in selected_themes
+        ),
+        key=lambda item: (-len(item[1]), item[0]),
+    )
+    related_topics = [
+        record
+        for record in state["records"]["topics"].values()
+        if record.get("theme") in selected_themes
+    ]
+    related_signals = [
+        record
+        for record in state["records"]["signals"].values()
+        if record.get("theme") in selected_themes and record.get("status") == "tentative"
+    ]
+    candidate_inventory = [
+        "- "
+        f"`{record['id']}` · {record.get('date', 'unknown')} · "
+        f"{len(record.get('quote_ids', []))} 原话 · "
+        f"{'无派生资产' if not record.get('topic_ids') and not record.get('signal_ids') else '重复主题上下文'}"
+        for record in selected
+    ]
+    repeated_theme_lines = [
+        f"- {theme}（{len(session_ids)} 次会话）：{', '.join(f'`{value}`' for value in session_ids)}"
+        for theme, session_ids in repeated_themes
+    ]
+    session_content, _ = markdown_asset_section(store, selected)
+    topic_content, _ = markdown_asset_section(
+        store, sorted(related_topics, key=lambda record: record["id"])
+    )
+    signal_content, _ = markdown_asset_section(
+        store, sorted(related_signals, key=lambda record: record["id"])
+    )
+    return "\n".join(
+        [
+            "# Expression Spark 周期归并候选包",
+            "",
+            f"- Skill 版本：{skill_version()}",
+            f"- 生成时间：{iso_now()}",
+            f"- 资产库：`{store.root}`",
+            f"- 候选会话：{len(selected)}",
+            "",
+            "> 本候选包只读取已经确认保存的资产。Agent 可以提出派生建议，但未经用户整批确认不得写入。",
+            "",
+            "## 本批候选会话",
+            "",
+            "\n".join(candidate_inventory) or "- 无",
+            "",
+            "## 本批未覆盖的候选会话",
+            "",
+            format_list(f"`{session_id}`" for session_id in skipped),
+            "",
+            "## 跨会话重复主题",
+            "",
+            "\n".join(repeated_theme_lines) or "- 无",
+            "",
+            "## 相关已有选题",
+            "",
+            topic_content,
+            "",
+            "## 相关暂定画像信号",
+            "",
+            signal_content,
+            "",
+            "## 候选会话与准确原话",
+            "",
+            session_content,
+            "",
+            "## Agent 归并要求",
+            "",
+            "- 只基于本包中的准确原话提出选题和信号，不补写用户没有说过的经历或立场。",
+            "- 优先复用相同含义的已有 signal_id，并补充跨会话证据。",
+            "- recurring 必须有至少 3 次不同会话证据；confirmed 必须由用户明确认领。",
+            "- 不强求每个候选会话都形成派生资产；审阅卡中列出本次覆盖和跳过的会话。",
+            "- 先展示一次整批审阅卡，用户确认后再生成 synthesis payload。",
+            "",
+        ]
+    )
+
+
+def normalized_synthesis_batch(payload: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    batch = copy.deepcopy(payload.get("batch") or {})
+    batch["id"] = require_id(str(batch.get("id") or ""), "synthesis batch id")
+    batch["date"] = str(batch.get("date") or date.today().isoformat())
+    source_session_ids = [str(value) for value in batch.get("source_session_ids", [])]
+    batch["source_session_ids"] = list(dict.fromkeys(source_session_ids))
+    if not batch["source_session_ids"]:
+        raise LibraryError("synthesis batch requires source_session_ids")
+    unknown = set(batch["source_session_ids"]) - set(state["records"]["sessions"])
+    if unknown:
+        raise LibraryError(f"synthesis batch references unknown sessions: {', '.join(sorted(unknown))}")
+    if batch["id"] in state.get("synthesis_batches", {}):
+        raise LibraryError(f"synthesis batch already exists: {batch['id']}")
+    return batch
+
+
+def prepare_synthesis(
+    store: LibraryStore,
+    state: dict[str, Any],
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    if payload.get("confirmed") is not True:
+        raise LibraryError("synthesize refused: payload must contain confirmed: true after user review")
+    if payload.get("session") or payload.get("quotes"):
+        raise LibraryError("synthesize cannot create or modify sessions or quotes")
+    batch = normalized_synthesis_batch(payload, state)
+    pseudo_session = {
+        "id": batch["id"],
+        "date": batch["date"],
+        "themes": [],
+    }
+    raw_topics = {
+        str(item.get("id")): item for item in payload.get("topics", []) if item.get("id")
+    }
+    raw_signals = {
+        str(item.get("id")): item for item in payload.get("signals", []) if item.get("id")
+    }
+    topics = normalized_topics(payload, pseudo_session)
+    signals = normalized_signals(payload, pseudo_session)
+    if not topics and not signals:
+        raise LibraryError("synthesize requires at least one topic or signal")
+    topic_ids = [item["id"] for item in topics]
+    signal_ids = [item["id"] for item in signals]
+    if len(topic_ids) != len(set(topic_ids)):
+        raise LibraryError("duplicate topic ids in synthesis payload")
+    if len(signal_ids) != len(set(signal_ids)):
+        raise LibraryError("duplicate signal ids in synthesis payload")
+    records = state["records"]
+    known_quote_ids = set(records["quotes"])
+    source_session_ids = set(batch["source_session_ids"])
+    topic_changes = []
+    for topic in topics:
+        missing_fields = [
+            field for field in ("title", "fact_core", "tension", "audience") if not topic.get(field)
+        ]
+        if missing_fields:
+            raise LibraryError(
+                f"synthesis topic {topic['id']} requires complete fields: {', '.join(missing_fields)}"
+            )
+        unknown = set(topic["quote_ids"]) - known_quote_ids
+        if unknown:
+            raise LibraryError(f"topic {topic['id']} references unknown quotes: {', '.join(sorted(unknown))}")
+        incoming_sessions = set(session_ids_for_quotes(state, topic["quote_ids"]))
+        outside = incoming_sessions - source_session_ids
+        if outside:
+            raise LibraryError(
+                f"topic {topic['id']} cites sessions outside batch: {', '.join(sorted(outside))}"
+            )
+        existing = records["topics"].get(topic["id"], {})
+        raw_topic = raw_topics.get(topic["id"], {})
+        if existing and "status" not in raw_topic:
+            topic["status"] = existing.get("status", topic["status"])
+        if existing and not raw_topic.get("theme"):
+            topic["theme"] = existing.get("theme", topic["theme"])
+        merged_quote_ids = list(dict.fromkeys(existing.get("quote_ids", []) + topic["quote_ids"]))
+        topic_changes.append(
+            {
+                "item": topic,
+                "existing": existing,
+                "merged_quote_ids": merged_quote_ids,
+                "source_session_ids": session_ids_for_quotes(state, merged_quote_ids),
+            }
+        )
+    known_signal_ids = set(records["signals"]) | set(signal_ids)
+    signal_changes = []
+    for signal in signals:
+        unknown = set(signal["evidence_quote_ids"]) - known_quote_ids
+        if unknown:
+            raise LibraryError(
+                f"signal {signal['id']} references unknown quotes: {', '.join(sorted(unknown))}"
+            )
+        incoming_sessions = set(session_ids_for_quotes(state, signal["evidence_quote_ids"]))
+        outside = incoming_sessions - source_session_ids
+        if outside:
+            raise LibraryError(
+                f"signal {signal['id']} cites sessions outside batch: {', '.join(sorted(outside))}"
+            )
+        existing = records["signals"].get(signal["id"], {})
+        raw_signal = raw_signals.get(signal["id"], {})
+        if existing and "type" not in raw_signal:
+            signal["type"] = existing.get("type", signal["type"])
+        if existing and "status" not in raw_signal:
+            signal["status"] = existing.get("status", signal["status"])
+        if existing and not raw_signal.get("theme"):
+            signal["theme"] = existing.get("theme", signal["theme"])
+        if existing and existing.get("type") != signal["type"]:
+            raise LibraryError(
+                f"signal {signal['id']} cannot change type from {existing.get('type')} to {signal['type']}"
+            )
+        if existing and existing.get("status") == "confirmed":
+            old_claim = extract_section(store.read_text(existing["path"]), "画像判断")
+            if old_claim and old_claim != signal["claim"] and not signal["user_confirmed"]:
+                raise LibraryError(
+                    f"confirmed signal {signal['id']} cannot change claim without user_confirmed: true"
+                )
+        merged_quote_ids = list(
+            dict.fromkeys(existing.get("evidence_quote_ids", []) + signal["evidence_quote_ids"])
+        )
+        evidence_session_ids = session_ids_for_quotes(state, merged_quote_ids)
+        incoming_status = signal["status"]
+        if existing.get("status") == "confirmed" and incoming_status not in {"confirmed", "retired"}:
+            incoming_status = "confirmed"
+        if existing.get("status") == "recurring" and incoming_status == "tentative":
+            incoming_status = "recurring"
+        if incoming_status == "recurring" and len(evidence_session_ids) < 3:
+            raise LibraryError(
+                f"signal {signal['id']} cannot be recurring with evidence from only "
+                f"{len(evidence_session_ids)} session(s)"
+            )
+        contradictions = list(dict.fromkeys(existing.get("contradicts", []) + signal["contradicts"]))
+        if incoming_status == "contradicted" and not contradictions:
+            raise LibraryError(f"contradicted signal {signal['id']} must name the signal it contradicts")
+        unknown_contradictions = set(contradictions) - known_signal_ids
+        if unknown_contradictions:
+            raise LibraryError(
+                f"signal {signal['id']} contradicts unknown signals: "
+                f"{', '.join(sorted(unknown_contradictions))}"
+            )
+        signal["status"] = incoming_status
+        signal["contradicts"] = contradictions
+        signal_changes.append(
+            {
+                "item": signal,
+                "existing": existing,
+                "merged_quote_ids": merged_quote_ids,
+                "evidence_session_ids": evidence_session_ids,
+            }
+        )
+    return {
+        "batch": batch,
+        "topic_changes": topic_changes,
+        "signal_changes": signal_changes,
+        "impact": {
+            "batch_id": batch["id"],
+            "source_session_ids": batch["source_session_ids"],
+            "topics_created": sorted(
+                change["item"]["id"] for change in topic_changes if not change["existing"]
+            ),
+            "topics_updated": sorted(
+                change["item"]["id"] for change in topic_changes if change["existing"]
+            ),
+            "signals_created": sorted(
+                change["item"]["id"] for change in signal_changes if not change["existing"]
+            ),
+            "signals_updated": sorted(
+                change["item"]["id"] for change in signal_changes if change["existing"]
+            ),
+        },
+    }
+
+
+def apply_synthesis(store: LibraryStore, state: dict[str, Any], prepared: dict[str, Any]) -> None:
+    records = state["records"]
+    batch = prepared["batch"]
+    for change in prepared["topic_changes"]:
+        topic = change["item"]
+        existing = change["existing"]
+        quote_ids = change["merged_quote_ids"]
+        source_session_ids = change["source_session_ids"]
+        topic_path = f"topics/{topic['id']}.md"
+        topic_text = render_template(
+            "topic-template.md",
+            {
+                "topic_id": topic["id"],
+                "date": batch["date"],
+                "theme": topic["theme"],
+                "status": topic["status"],
+                "source_sessions_json": json.dumps(source_session_ids, ensure_ascii=False),
+                "title": topic["title"],
+                "fact_core": topic["fact_core"],
+                "tension": topic["tension"],
+                "audience": topic["audience"],
+                "angles": format_list(topic["angles"]),
+                "evidence": evidence_lines(quote_ids, state),
+            },
+        )
+        store.write_text(topic_path, topic_text)
+        records["topics"][topic["id"]] = {
+            "id": topic["id"],
+            "path": topic_path,
+            "status": topic["status"],
+            "session_id": source_session_ids[0] if len(source_session_ids) == 1 else None,
+            "source_session_ids": source_session_ids,
+            "theme": topic["theme"],
+            "quote_ids": quote_ids,
+            "created_at": existing.get("created_at") or iso_now(),
+            "updated_at": iso_now(),
+        }
+    for change in prepared["signal_changes"]:
+        signal = change["item"]
+        existing = change["existing"]
+        quote_ids = change["merged_quote_ids"]
+        evidence_session_ids = change["evidence_session_ids"]
+        signal_path = f"signals/{signal['id']}.md"
+        signal_text = render_template(
+            "signal-template.md",
+            {
+                "signal_id": signal["id"],
+                "signal_type": signal["type"],
+                "status": signal["status"],
+                "confidence": signal["confidence"],
+                "theme": signal["theme"],
+                "source_date": batch["date"],
+                "updated": iso_now(),
+                "claim": signal["claim"],
+                "status_reason": status_reason(signal, len(evidence_session_ids)),
+                "evidence": evidence_lines(quote_ids, state),
+                "source_sessions": format_list(evidence_session_ids),
+                "contradiction": format_list(signal["contradicts"]),
+            },
+        )
+        store.write_text(signal_path, signal_text)
+        records["signals"][signal["id"]] = {
+            "id": signal["id"],
+            "path": signal_path,
+            "type": signal["type"],
+            "status": signal["status"],
+            "theme": signal["theme"],
+            "evidence_quote_ids": quote_ids,
+            "evidence_session_ids": evidence_session_ids,
+            "user_confirmed": bool(existing.get("user_confirmed") or signal["user_confirmed"]),
+            "contradicts": signal["contradicts"],
+            "updated_at": iso_now(),
+        }
+    state["synthesis_batches"][batch["id"]] = {
+        "id": batch["id"],
+        "date": batch["date"],
+        "source_session_ids": batch["source_session_ids"],
+        "topic_ids": sorted(change["item"]["id"] for change in prepared["topic_changes"]),
+        "signal_ids": sorted(change["item"]["id"] for change in prepared["signal_changes"]),
+        "created_at": iso_now(),
+    }
+    rebuild_session_derivative_links(store, state)
+    update_stats(state)
+    rebuild_profile(store, state)
+    store.write_state(state)
+
+
+def cmd_synthesize(args: argparse.Namespace) -> int:
+    store, state = load_store(args.library)
+    if not args.payload:
+        output = synthesis_context_markdown(store, state, args.session_limit)
+        if args.output:
+            path = Path(args.output).expanduser().resolve()
+            try:
+                path.relative_to(store.root)
+            except ValueError:
+                pass
+            else:
+                raise LibraryError("synthesize context output must be outside the evidence library")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(output, encoding="utf-8")
+            print(dump_json({"ok": True, "mode": "context", "output": str(path)}), end="")
+        else:
+            print(output, end="")
+        return 0
+    payload = load_json(Path(args.payload).expanduser().resolve())
+    prepared = prepare_synthesis(store, state, payload)
+    result = {
+        "ok": True,
+        "mode": "dry-run" if args.dry_run else "apply",
+        "impact": prepared["impact"],
+    }
+    if args.apply:
+        apply_synthesis(store, state, prepared)
+        report = validation_report(store, state)
+        result["validation"] = report
+        if not report["ok"]:
+            print(dump_json(result), end="")
+            return 1
+    print(dump_json(result), end="")
+    return 0
+
+
 def walk_keys(value: Any, path: str = "") -> Iterable[tuple[str, Any]]:
     if isinstance(value, dict):
         for key, item in value.items():
@@ -1266,6 +1735,10 @@ def validation_report(store: LibraryStore, state: dict[str, Any]) -> dict[str, A
         unknown = set(topic.get("quote_ids", [])) - set(quotes)
         if unknown:
             errors.append(f"topic {topic_id} references missing quotes: {', '.join(sorted(unknown))}")
+        expected_sessions = set(session_ids_for_quotes(state, topic.get("quote_ids", [])))
+        indexed_sessions = set(topic.get("source_session_ids", []))
+        if indexed_sessions and indexed_sessions != expected_sessions:
+            errors.append(f"topic {topic_id} source_session_ids differ from quote evidence")
     for signal_id, signal in signals.items():
         if signal.get("status") not in SIGNAL_STATUSES:
             errors.append(f"signal {signal_id} has invalid status {signal.get('status')}")
@@ -1280,6 +1753,38 @@ def validation_report(store: LibraryStore, state: dict[str, Any]) -> dict[str, A
         if unknown_contradictions:
             errors.append(
                 f"signal {signal_id} contradicts missing signals: {', '.join(sorted(unknown_contradictions))}"
+            )
+    for session_id, session in sessions.items():
+        expected_topics = {
+            topic_id
+            for topic_id, topic in topics.items()
+            if session_id in session_ids_for_quotes(state, topic.get("quote_ids", []))
+        }
+        expected_signals = {
+            signal_id
+            for signal_id, signal in signals.items()
+            if session_id in session_ids_for_quotes(state, signal.get("evidence_quote_ids", []))
+        }
+        if set(session.get("topic_ids", [])) != expected_topics:
+            errors.append(f"session {session_id} topic_ids differ from quote evidence")
+        if set(session.get("signal_ids", [])) != expected_signals:
+            errors.append(f"session {session_id} signal_ids differ from quote evidence")
+    for batch_id, batch in state.get("synthesis_batches", {}).items():
+        unknown_sessions = set(batch.get("source_session_ids", [])) - set(sessions)
+        unknown_topics = set(batch.get("topic_ids", [])) - set(topics)
+        unknown_signals = set(batch.get("signal_ids", [])) - set(signals)
+        if unknown_sessions:
+            errors.append(
+                f"synthesis batch {batch_id} references missing sessions: "
+                f"{', '.join(sorted(unknown_sessions))}"
+            )
+        if unknown_topics:
+            errors.append(
+                f"synthesis batch {batch_id} references missing topics: {', '.join(sorted(unknown_topics))}"
+            )
+        if unknown_signals:
+            errors.append(
+                f"synthesis batch {batch_id} references missing signals: {', '.join(sorted(unknown_signals))}"
             )
     computed = compute_stats(state)
     if state.get("stats") != computed:
@@ -1362,7 +1867,6 @@ def find_forget_impact(state: dict[str, Any], store: LibraryStore, args: argpars
     for session_id in list(sessions_to_delete):
         session = records["sessions"][session_id]
         quotes_to_delete.update(session.get("quote_ids", []))
-        topics_to_delete.update(session.get("topic_ids", []))
     for session_id, session in records["sessions"].items():
         if set(session.get("quote_ids", [])) and set(session.get("quote_ids", [])) <= quotes_to_delete:
             sessions_to_delete.add(session_id)
@@ -1428,6 +1932,10 @@ def apply_forget(store: LibraryStore, state: dict[str, Any], impact: dict[str, A
             text = remove_lines_containing(store.read_text(topic["path"]), removed)
             store.write_text(topic["path"], text)
             topic["quote_ids"] = impact["topics_to_update"][topic_id]
+            topic["source_session_ids"] = session_ids_for_quotes(state, topic["quote_ids"])
+            topic["session_id"] = (
+                topic["source_session_ids"][0] if len(topic["source_session_ids"]) == 1 else None
+            )
 
     for signal_id, signal in list(records["signals"].items()):
         if signal_id in signals_to_delete:
@@ -1466,6 +1974,17 @@ def apply_forget(store: LibraryStore, state: dict[str, Any], impact: dict[str, A
             signal["status"] = "tentative"
             text = replace_frontmatter_status(text, "tentative")
         store.write_text(signal["path"], text)
+    for batch in state.get("synthesis_batches", {}).values():
+        batch["source_session_ids"] = [
+            value for value in batch.get("source_session_ids", []) if value not in sessions_to_delete
+        ]
+        batch["topic_ids"] = [
+            value for value in batch.get("topic_ids", []) if value not in topics_to_delete
+        ]
+        batch["signal_ids"] = [
+            value for value in batch.get("signal_ids", []) if value not in signals_to_delete
+        ]
+    rebuild_session_derivative_links(store, state)
     update_stats(state)
     rebuild_profile(store, state)
     store.write_state(state)
@@ -1533,6 +2052,19 @@ def build_parser() -> argparse.ArgumentParser:
     feedback_parser.add_argument("--session-limit", type=int, default=12)
     feedback_parser.set_defaults(func=cmd_feedback)
 
+    synthesize_parser = subparsers.add_parser(
+        "synthesize",
+        help="export or apply a user-confirmed cross-session synthesis",
+    )
+    synthesize_parser.add_argument("--library", required=True)
+    synthesize_parser.add_argument("--output")
+    synthesize_parser.add_argument("--session-limit", type=int, default=10)
+    synthesize_parser.add_argument("--payload")
+    synthesis_action = synthesize_parser.add_mutually_exclusive_group()
+    synthesis_action.add_argument("--dry-run", action="store_true")
+    synthesis_action.add_argument("--apply", action="store_true")
+    synthesize_parser.set_defaults(func=cmd_synthesize)
+
     forget_parser = subparsers.add_parser("forget", help="preview or apply a confirmed forget request")
     forget_parser.add_argument("--library", required=True)
     forget_parser.add_argument("--quote-id", action="append")
@@ -1552,6 +2084,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "feedback" and args.session_limit < 1:
         parser.error("feedback --session-limit must be at least 1")
+    if args.command == "synthesize":
+        if args.session_limit < 1:
+            parser.error("synthesize --session-limit must be at least 1")
+        if args.payload and not (args.dry_run or args.apply):
+            parser.error("synthesize --payload requires --dry-run or --apply")
+        if not args.payload and (args.dry_run or args.apply):
+            parser.error("synthesize --dry-run/--apply requires --payload")
+        if args.payload and args.output:
+            parser.error("synthesize --output cannot be used with --payload")
     if args.command == "forget" and not any(
         [args.quote_id, args.session_id, args.topic_id, args.signal_id, args.contains]
     ):

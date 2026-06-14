@@ -3,7 +3,7 @@ id: "{{topic_id}}"
 date: "{{date}}"
 theme: "{{theme}}"
 status: "{{status}}"
-source_session: "{{session_id}}"
+source_sessions: {{source_sessions_json}}
 tags:
   - expression/topic
 ---
@@ -31,4 +31,3 @@ tags:
 ## 原话证据
 
 {{evidence}}
-

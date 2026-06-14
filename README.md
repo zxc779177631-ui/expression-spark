@@ -148,6 +148,13 @@ python3 scripts/library.py validate --library "<资产库路径>"
 # 导出默认不含语料正文的试用成果快照
 python3 scripts/library.py feedback --library "<资产库路径>" --output outcomes.md
 
+# 导出只读周期归并候选包
+python3 scripts/library.py synthesize --library "<资产库路径>" --output synthesis-context.md
+
+# 校验并应用用户确认后的周期归并
+python3 scripts/library.py synthesize --library "<资产库路径>" --payload synthesis.json --dry-run
+python3 scripts/library.py synthesize --library "<资产库路径>" --payload synthesis.json --apply
+
 # 先预览遗忘影响，确认后再应用
 python3 scripts/library.py forget --library "<资产库路径>" --contains "前合伙人" --dry-run
 ```
@@ -166,6 +173,7 @@ python3 -m unittest discover -s tests -v
 - 默认模式切换
 - 重复画像证据门槛
 - Persona 准备度
+- 跨会话周期归并与重复批次保护
 - 确认画像防静默改写
 - 遗忘影响预览与派生画像重建
 

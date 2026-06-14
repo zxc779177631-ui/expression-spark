@@ -300,6 +300,254 @@ class LibraryCliTest(unittest.TestCase):
         self.assertNotIn("should-not-leak-123456", content.stdout)
         self.assertIn("api_key=[REDACTED]", content.stdout)
 
+    def test_synthesize_context_is_read_only_and_prioritizes_unprocessed_sessions(self) -> None:
+        for session_number in range(1, 4):
+            payload = self.payload(session_number)
+            payload["topics"] = []
+            payload["signals"] = []
+            self.assertEqual(self.register(payload, f"source-{session_number}.json").returncode, 0)
+        before_state = (self.root / "state.json").read_text(encoding="utf-8")
+        before_assets = {
+            path.relative_to(self.root).as_posix(): path.read_text(encoding="utf-8")
+            for path in self.root.rglob("*.md")
+        }
+        output = Path(self.temp.name) / "synthesis-context.md"
+        result = self.run_cli(
+            "synthesize",
+            "--library",
+            str(self.root),
+            "--session-limit",
+            "2",
+            "--output",
+            str(output),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = output.read_text(encoding="utf-8")
+        self.assertIn("周期归并候选包", text)
+        self.assertIn("2026-06-02-session", text)
+        self.assertIn("2026-06-03-session", text)
+        self.assertIn("2026-06-01-session", text)
+        self.assertLess(text.index("2026-06-02-session"), text.index("2026-06-03-session"))
+        self.assertIn("第3次会话的原话1", text)
+        self.assertEqual((self.root / "state.json").read_text(encoding="utf-8"), before_state)
+        after_assets = {
+            path.relative_to(self.root).as_posix(): path.read_text(encoding="utf-8")
+            for path in self.root.rglob("*.md")
+        }
+        self.assertEqual(after_assets, before_assets)
+
+    def test_synthesize_requires_confirmation_and_rejects_unknown_evidence(self) -> None:
+        source = self.payload(1)
+        source["topics"] = []
+        source["signals"] = []
+        self.assertEqual(self.register(source, "source.json").returncode, 0)
+        synthesis = {
+            "confirmed": False,
+            "batch": {
+                "id": "synthesis-test-01",
+                "date": "2026-06-14",
+                "source_session_ids": [source["session"]["id"]],
+            },
+            "topics": [
+                {
+                    "id": "synthesis-topic",
+                    "title": "跨会话选题",
+                    "fact_core": "具体事实",
+                    "tension": "具体张力",
+                    "audience": "服务型创业者",
+                    "quote_ids": [source["quotes"][0]["id"]],
+                }
+            ],
+        }
+        path = self.write_payload(synthesis, "unconfirmed-synthesis.json")
+        result = self.run_cli(
+            "synthesize", "--library", str(self.root), "--payload", str(path), "--dry-run"
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("confirmed: true", result.stderr)
+        synthesis["confirmed"] = True
+        synthesis["topics"][0]["quote_ids"] = ["unknown-quote"]
+        path = self.write_payload(synthesis, "unknown-synthesis.json")
+        result = self.run_cli(
+            "synthesize", "--library", str(self.root), "--payload", str(path), "--dry-run"
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unknown quotes", result.stderr)
+        synthesis["topics"] = []
+        synthesis["signals"] = [
+            {
+                "id": "unconfirmed-value",
+                "type": "value",
+                "claim": "用户明确认领的价值观。",
+                "status": "confirmed",
+                "evidence_quote_ids": [source["quotes"][0]["id"]],
+            }
+        ]
+        path = self.write_payload(synthesis, "unconfirmed-value-synthesis.json")
+        result = self.run_cli(
+            "synthesize", "--library", str(self.root), "--payload", str(path), "--dry-run"
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("requires user_confirmed: true", result.stderr)
+
+    def test_synthesize_applies_cross_session_derivatives_without_changing_quotes(self) -> None:
+        sources = []
+        for session_number in range(1, 4):
+            payload = self.payload(session_number)
+            payload["topics"] = []
+            payload["signals"] = []
+            if session_number == 1:
+                payload["signals"] = [
+                    {
+                        "id": "voice-boundary-first",
+                        "type": "voice",
+                        "claim": "用户经常通过边界取舍表达判断。",
+                        "status": "tentative",
+                        "confidence": 0.45,
+                        "theme": "客户选择",
+                        "evidence_quote_ids": [payload["quotes"][0]["id"]],
+                    }
+                ]
+            self.assertEqual(self.register(payload, f"source-{session_number}.json").returncode, 0)
+            sources.append(payload)
+        before = self.state()
+        quote_texts = {
+            path.relative_to(self.root).as_posix(): path.read_text(encoding="utf-8")
+            for path in (self.root / "sessions").rglob("*.md")
+        }
+        synthesis = {
+            "confirmed": True,
+            "batch": {
+                "id": "synthesis-test-apply",
+                "date": "2026-06-14",
+                "source_session_ids": [payload["session"]["id"] for payload in sources],
+            },
+            "topics": [
+                {
+                    "id": "cross-session-topic",
+                    "title": "跨会话选题",
+                    "fact_core": "三次表达都谈到客户选择。",
+                    "tension": "短期收入与长期交付质量。",
+                    "audience": "服务型创业者",
+                    "angles": ["为什么有些大客户不该接"],
+                    "theme": "客户选择",
+                    "quote_ids": [sources[0]["quotes"][0]["id"], sources[1]["quotes"][0]["id"]],
+                }
+            ],
+            "signals": [
+                {
+                    "id": "voice-boundary-first",
+                    "type": "voice",
+                    "claim": "用户经常通过边界取舍表达判断。",
+                    "status": "recurring",
+                    "confidence": 0.75,
+                    "theme": "客户选择",
+                    "evidence_quote_ids": [
+                        sources[1]["quotes"][0]["id"],
+                        sources[2]["quotes"][0]["id"],
+                    ],
+                }
+            ],
+        }
+        path = self.write_payload(synthesis, "synthesis-apply.json")
+        dry_run = self.run_cli(
+            "synthesize", "--library", str(self.root), "--payload", str(path), "--dry-run"
+        )
+        self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
+        self.assertEqual(self.state()["stats"], before["stats"])
+        apply = self.run_cli(
+            "synthesize", "--library", str(self.root), "--payload", str(path), "--apply"
+        )
+        self.assertEqual(apply.returncode, 0, apply.stdout + apply.stderr)
+        after = self.state()
+        self.assertEqual(after["stats"]["sessions"], before["stats"]["sessions"])
+        self.assertEqual(after["stats"]["quotes"], before["stats"]["quotes"])
+        self.assertEqual(after["stats"]["topics"], 1)
+        self.assertEqual(after["stats"]["signals"], before["stats"]["signals"])
+        self.assertEqual(after["stats"]["recurring_voice_patterns"], 1)
+        self.assertIn("synthesis-test-apply", after["synthesis_batches"])
+        for source in sources:
+            session = after["records"]["sessions"][source["session"]["id"]]
+            self.assertIn("voice-boundary-first", session["signal_ids"])
+        self.assertIn(
+            "cross-session-topic",
+            after["records"]["sessions"][sources[0]["session"]["id"]]["topic_ids"],
+        )
+        for relative, original in quote_texts.items():
+            current = (self.root / relative).read_text(encoding="utf-8")
+            for quote in sources:
+                for item in quote["quotes"]:
+                    if item["text"] in original:
+                        self.assertIn(item["text"], current)
+        validation = self.run_cli("validate", "--library", str(self.root), "--json")
+        self.assertEqual(validation.returncode, 0, validation.stdout + validation.stderr)
+
+        duplicate = self.run_cli(
+            "synthesize", "--library", str(self.root), "--payload", str(path), "--dry-run"
+        )
+        self.assertEqual(duplicate.returncode, 2)
+        self.assertIn("already exists", duplicate.stderr)
+
+    def test_forget_updates_cross_session_synthesis_instead_of_deleting_it(self) -> None:
+        sources = []
+        for session_number in range(1, 4):
+            payload = self.payload(session_number)
+            payload["topics"] = []
+            payload["signals"] = []
+            self.assertEqual(self.register(payload, f"source-{session_number}.json").returncode, 0)
+            sources.append(payload)
+        synthesis = {
+            "confirmed": True,
+            "batch": {
+                "id": "synthesis-forget",
+                "date": "2026-06-14",
+                "source_session_ids": [payload["session"]["id"] for payload in sources],
+            },
+            "topics": [
+                {
+                    "id": "cross-topic",
+                    "title": "跨会话选题",
+                    "fact_core": "来自多次表达。",
+                    "tension": "收入与边界。",
+                    "audience": "服务型创业者",
+                    "quote_ids": [payload["quotes"][0]["id"] for payload in sources],
+                }
+            ],
+            "signals": [
+                {
+                    "id": "cross-signal",
+                    "type": "voice",
+                    "claim": "用户反复通过取舍表达判断。",
+                    "status": "recurring",
+                    "evidence_quote_ids": [payload["quotes"][0]["id"] for payload in sources],
+                }
+            ],
+        }
+        path = self.write_payload(synthesis, "synthesis-forget.json")
+        self.assertEqual(
+            self.run_cli(
+                "synthesize", "--library", str(self.root), "--payload", str(path), "--apply"
+            ).returncode,
+            0,
+        )
+        forgotten_quote = sources[0]["quotes"][0]["id"]
+        result = self.run_cli(
+            "forget",
+            "--library",
+            str(self.root),
+            "--quote-id",
+            forgotten_quote,
+            "--apply",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        state = self.state()
+        self.assertIn("cross-topic", state["records"]["topics"])
+        self.assertEqual(len(state["records"]["topics"]["cross-topic"]["quote_ids"]), 2)
+        self.assertEqual(state["records"]["signals"]["cross-signal"]["status"], "tentative")
+        self.assertEqual(len(state["records"]["signals"]["cross-signal"]["evidence_session_ids"]), 2)
+        validation = self.run_cli("validate", "--library", str(self.root), "--json")
+        self.assertEqual(validation.returncode, 0, validation.stdout + validation.stderr)
+
     def test_forget_requires_preview_then_rebuilds(self) -> None:
         payload = self.payload(1, include_core_signals=True)
         result = self.register(payload, "forget-source.json")

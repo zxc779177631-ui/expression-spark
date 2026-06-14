@@ -2,6 +2,8 @@
 
 `library.py register` 接收一个 UTF-8 JSON 文件。只有用户审阅并确认后的内容才能进入 payload。
 
+`library.py synthesize` 接收周期归并 payload，只能基于已有原话创建或更新派生资产。
+
 ## 最小示例
 
 ```json
@@ -105,3 +107,55 @@
 - 选题和信号必须引用真实原话 ID。
 - 同一信号增加证据时复用相同 `signal.id`；不要创建多个近义信号来虚增重复模式。
 
+## 周期归并 Payload
+
+周期归并不会创建新会话或新原话。`batch.source_session_ids` 必须列出本批审阅过的来源会话；所有新增证据都必须来自这些会话。
+
+```json
+{
+  "confirmed": true,
+  "batch": {
+    "id": "synthesis-20260614-01",
+    "date": "2026-06-14",
+    "source_session_ids": [
+      "2026-06-13-gentle-06",
+      "2026-06-13-gentle-08",
+      "2026-06-14-content-coach-01"
+    ]
+  },
+  "topics": [
+    {
+      "id": "topic-expression-memory",
+      "title": "为什么老板缺的不是代写，而是能激发表达的人",
+      "fact_core": "用户在多次会话中反复讨论聊天采集和表达欲。",
+      "tension": "直接代写效率高，但容易失去本人判断。",
+      "audience": "想做个人 IP 但没有输出习惯的老板",
+      "angles": ["为什么越代写越不像本人"],
+      "theme": "表达欲",
+      "status": "unfilmed",
+      "quote_ids": ["q-existing-01", "q-existing-02"]
+    }
+  ],
+  "signals": [
+    {
+      "id": "signal-existing-voice-pattern",
+      "type": "voice",
+      "claim": "用户经常通过纠正不准确的概括来展开表达。",
+      "status": "recurring",
+      "confidence": 0.75,
+      "theme": "表达欲",
+      "evidence_quote_ids": ["q-existing-01", "q-existing-03", "q-existing-04"]
+    }
+  ]
+}
+```
+
+规则：
+
+- payload 必须包含 `confirmed: true`，并先使用 `--dry-run` 校验。
+- `topics` 和 `signals` 至少提供一类；不得包含 `session` 或 `quotes`。
+- 新选题和更新后的选题都必须提供完整的标题、事实核心、观点张力和适合人群。
+- 更新已有选题或信号时复用原 ID；新证据会与已有证据合并，不用于删除证据。
+- `recurring` 至少覆盖 3 次不同会话。
+- `confirmed` 和 `retired` 仍要求 `user_confirmed: true`。
+- 每个 `batch.id` 只能应用一次，防止重复落库。

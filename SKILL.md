@@ -139,6 +139,56 @@ python3 "$LIBRARY_TOOL" init \
 - 每积累约 5–10 次会话，或用户想查看成果时，检查重复主题、尚未形成选题/信号的会话和可继续话头。
 - 周期性归并是派生层整理，不改写、不删除原始会话；新选题和画像仍需遵守确认规则。
 
+用户想整理已有语料，或 `feedback` 显示较多会话没有派生资产时，先生成只读候选包：
+
+```bash
+python3 "$LIBRARY_TOOL" synthesize \
+  --library "<资产库路径>" \
+  --output "<资产库之外的路径>/synthesis-context.md"
+```
+
+候选包会优先选择没有选题或信号的会话，并补充重复主题、相关已有选题、暂定信号和准确原话。Agent 负责理解语义，脚本只负责整理证据和验证落库，不要让脚本自动定义用户。
+
+基于候选包展示一次“周期归并审阅卡”：
+
+```markdown
+## 周期归并审阅
+
+### 建议新增或更新的选题
+- 选题内容、引用的 quote_id、覆盖的 session_id
+
+### 建议新增或更新的画像信号
+- 信号内容、状态、引用的 quote_id、覆盖的 session_id
+- 说明为什么是 tentative / recurring / confirmed
+
+### 本次覆盖与跳过
+- 覆盖了哪些会话
+- 哪些会话没有足够证据，暂不提炼
+
+你可以回复：全部保存 / 修改后保存 / 只保存选题 / 只保存画像 / 本次不保存。
+```
+
+- 普通“全部保存”只允许保存 `tentative` 和证据达标的 `recurring`。
+- 如果包含 `confirmed` 或 `retired`，必须单独指出待认领项；只有用户明确回复“全部保存并确认待认领项”或逐条确认，才设置 `user_confirmed: true`。
+- 相同含义的信号必须复用已有 `signal.id` 并补充证据，不要创建近义信号。
+- 不强求每个候选会话都形成选题或画像。
+
+确认后，按 [references/asset-schema.md](references/asset-schema.md) 创建周期归并 payload。先校验，再应用：
+
+```bash
+python3 "$LIBRARY_TOOL" synthesize \
+  --library "<资产库路径>" \
+  --payload "<确认后的 synthesis-payload.json>" \
+  --dry-run
+
+python3 "$LIBRARY_TOOL" synthesize \
+  --library "<资产库路径>" \
+  --payload "<确认后的 synthesis-payload.json>" \
+  --apply
+```
+
+应用完成后运行 `validate` 和 `status`。归并只创建或更新派生资产，不创建新会话、不新增或改写原话。
+
 ## 第四步：结束时生成一次审阅卡
 
 用户想结束，或已经获得 3–8 条有信息量的原话时，停止采访。展示以下结构，先不写入资产库：

@@ -27,7 +27,10 @@ tags:
 
 {{signal_links}}
 
+## 本次独立案例
+
+{{case_links}}
+
 ## 下次可继续
 
 {{next_threads}}
-

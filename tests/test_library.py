@@ -168,6 +168,96 @@ class LibraryCliTest(unittest.TestCase):
         self.assertEqual(validation.returncode, 0, validation.stdout + validation.stderr)
         self.assertTrue(json.loads(validation.stdout)["ok"])
 
+    def test_cases_preserve_event_boundaries_and_fact_inference_split(self) -> None:
+        payload = self.payload(1)
+        payload["topics"] = []
+        payload["signals"] = []
+        payload["quotes"][0]["text"] = "Hermes 折腾两天半，最后没有装好，0 产出，还耽误了正事。"
+        payload["quotes"][1]["text"] = "另一次任务里，AI 说没权限就停了。"
+        payload["quotes"][2]["text"] = "我提醒它没权限可以找我要，它才继续。"
+        payload["cases"] = [
+            {
+                "id": "case-hermes-install",
+                "title": "Hermes 安装失败",
+                "goal": "安装 Hermes",
+                "obstacle": "安装过程反复失败",
+                "result": "最终没有装好",
+                "costs": ["花费两天半", "0 产出", "耽误正事"],
+                "lesson": "研究工具可能反而拖累正事。",
+                "quote_ids": [payload["quotes"][0]["id"]],
+                "confirmed_fact_quote_ids": [payload["quotes"][0]["id"]],
+            },
+            {
+                "id": "case-ai-permission",
+                "title": "AI 不主动索要权限",
+                "obstacle": "AI 遇到权限不足后停止",
+                "user_action": "用户提醒 AI 可以主动索要权限",
+                "result": "AI 被提醒后继续",
+                "lesson": "AI 缺乏主动向上反馈意识。",
+                "quote_ids": [payload["quotes"][1]["id"], payload["quotes"][2]["id"]],
+                "confirmed_fact_quote_ids": [payload["quotes"][1]["id"], payload["quotes"][2]["id"]],
+            },
+        ]
+        result = self.register(payload, "two-cases.json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.state()
+        self.assertEqual(state["stats"]["cases"], 2)
+        self.assertEqual(set(state["records"]["cases"]), {"case-hermes-install", "case-ai-permission"})
+        self.assertNotIn("AI 缺乏主动向上反馈意识", (self.root / "state.json").read_text(encoding="utf-8"))
+        permission = (self.root / "cases" / "case-ai-permission.md").read_text(encoding="utf-8")
+        self.assertIn("## 已确认事实证据", permission)
+        self.assertIn("## 推断或启示", permission)
+        self.assertIn("本节是派生判断，不等同于已确认事实", permission)
+        context = self.run_cli("context", "--library", str(self.root), "--query", "权限")
+        self.assertEqual(context.returncode, 0, context.stderr)
+        self.assertIn("Relevant independent cases", context.stdout)
+        self.assertIn("Keep different case_id values separate", context.stdout)
+
+    def test_case_rejects_unknown_or_outside_fact_evidence(self) -> None:
+        payload = self.payload(1)
+        payload["cases"] = [
+            {
+                "id": "bad-case",
+                "title": "证据越界",
+                "quote_ids": [payload["quotes"][0]["id"]],
+                "confirmed_fact_quote_ids": [payload["quotes"][1]["id"]],
+            }
+        ]
+        result = self.register(payload, "outside-facts.json")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("outside the case", result.stderr)
+        payload["cases"][0]["quote_ids"] = ["unknown-quote"]
+        payload["cases"][0]["confirmed_fact_quote_ids"] = ["unknown-quote"]
+        result = self.register(payload, "unknown-case-evidence.json")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unknown quotes", result.stderr)
+
+    def test_forget_quote_removes_case_to_avoid_stale_derived_story(self) -> None:
+        payload = self.payload(1)
+        payload["topics"] = []
+        payload["signals"] = []
+        payload["cases"] = [
+            {
+                "id": "case-to-forget",
+                "title": "会被遗忘的案例",
+                "result": "没有完成",
+                "quote_ids": [payload["quotes"][0]["id"], payload["quotes"][1]["id"]],
+                "confirmed_fact_quote_ids": [payload["quotes"][0]["id"]],
+            }
+        ]
+        self.assertEqual(self.register(payload, "case-forget.json").returncode, 0)
+        result = self.run_cli(
+            "forget",
+            "--library",
+            str(self.root),
+            "--quote-id",
+            payload["quotes"][0]["id"],
+            "--apply",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("case-to-forget", self.state()["records"]["cases"])
+        self.assertFalse((self.root / "cases" / "case-to-forget.md").exists())
+
     def test_register_rejects_full_transcript_in_summary(self) -> None:
         payload = self.payload(1)
         payload["session"]["summary"] = "长" * 601

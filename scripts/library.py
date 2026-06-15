@@ -27,6 +27,7 @@ SIGNAL_TYPES = {"voice", "value", "stance", "boundary", "tension", "business"}
 MODES = {"deep-interviewer", "gentle-journal", "content-coach"}
 TOPIC_STATUSES = {"unfilmed", "drafted", "filmed", "retired"}
 REQUIRED_DIRS = ("sessions", "topics", "signals", "profile", "generated")
+INIT_ONLY_DIRS = ("cases",)
 REQUIRED_FILES = ("config.md", "profile/current.md", "state.json")
 STATE_CONTENT_KEYS = {"text", "claim", "summary", "fact_core", "tension", "audience", "angles", "content"}
 QUOTE_BLOCK_RE = re.compile(
@@ -234,6 +235,7 @@ def load_store(library: str) -> tuple[LibraryStore, dict[str, Any]]:
     root = Path(library).expanduser().resolve()
     state = load_json(root / "state.json")
     state.setdefault("synthesis_batches", {})
+    state.setdefault("records", {}).setdefault("cases", {})
     backend = state.get("settings", {}).get("backend", "filesystem")
     vault_root = detect_obsidian_vault() if backend == "obsidian" else None
     return LibraryStore(root, backend, vault_root), state
@@ -257,7 +259,7 @@ def new_state(slug: str, name: str, default_mode: str, backend: str) -> dict[str
         "updated_at": iso_now(),
         "user": {"slug": slug, "name": name},
         "settings": {"default_mode": default_mode, "backend": backend},
-        "records": {"sessions": {}, "quotes": {}, "topics": {}, "signals": {}},
+        "records": {"sessions": {}, "quotes": {}, "cases": {}, "topics": {}, "signals": {}},
         "synthesis_batches": {},
         "persona": {
             "last_generated_at": None,
@@ -335,7 +337,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     store = choose_init_store(args)
     if (store.root / "state.json").exists():
         raise LibraryError(f"library already exists: {store.root}")
-    for directory in REQUIRED_DIRS:
+    for directory in REQUIRED_DIRS + INIT_ONLY_DIRS:
         (store.root / directory).mkdir(parents=True, exist_ok=True)
     slug = safe_slug(args.user_slug)
     state = new_state(slug, args.name, args.default_mode, store.backend)
@@ -413,6 +415,37 @@ def normalized_topics(payload: dict[str, Any], session: dict[str, Any]) -> list[
         if not item["quote_ids"]:
             raise LibraryError(f"topic {item['id']} must reference at least one quote")
         result.append(item)
+    return result
+
+
+def normalized_cases(payload: dict[str, Any], session: dict[str, Any]) -> list[dict[str, Any]]:
+    result = []
+    for index, original in enumerate(payload.get("cases") or [], start=1):
+        item = copy.deepcopy(original)
+        item["id"] = require_id(str(item.get("id") or f"case-{session['id']}-{index:02d}"), "case id")
+        item["title"] = str(item.get("title") or item["id"]).strip()
+        item["theme"] = str(item.get("theme") or (session["themes"][0] if session["themes"] else "")).strip()
+        for field in ("scene", "goal", "action", "obstacle", "user_action", "result", "lesson"):
+            item[field] = str(item.get(field) or "").strip()
+        item["costs"] = [str(value).strip() for value in item.get("costs", []) if str(value).strip()]
+        item["quote_ids"] = list(dict.fromkeys(str(value) for value in item.get("quote_ids", [])))
+        item["confirmed_fact_quote_ids"] = list(
+            dict.fromkeys(str(value) for value in item.get("confirmed_fact_quote_ids", []))
+        )
+        if not item["quote_ids"]:
+            raise LibraryError(f"case {item['id']} must reference at least one quote")
+        if not item["confirmed_fact_quote_ids"]:
+            raise LibraryError(f"case {item['id']} must identify confirmed_fact_quote_ids")
+        outside = set(item["confirmed_fact_quote_ids"]) - set(item["quote_ids"])
+        if outside:
+            raise LibraryError(
+                f"case {item['id']} confirmed facts reference quotes outside the case: "
+                f"{', '.join(sorted(outside))}"
+            )
+        result.append(item)
+    ids = [item["id"] for item in result]
+    if len(ids) != len(set(ids)):
+        raise LibraryError("duplicate case ids in payload")
     return result
 
 
@@ -516,6 +549,7 @@ def compute_stats(state: dict[str, Any]) -> dict[str, Any]:
     quotes = records.get("quotes", {})
     topics = records.get("topics", {})
     signals = records.get("signals", {})
+    cases = records.get("cases", {})
     themes = {
         theme
         for topic in topics.values()
@@ -578,6 +612,7 @@ def compute_stats(state: dict[str, Any]) -> dict[str, Any]:
         "quotes": len(quotes),
         "topics": len(topics),
         "signals": len(signals),
+        "cases": len(cases),
         "themes": sorted(themes),
         "stories_or_decisions": story_count,
         "voice_signals": len(voice_signals),
@@ -630,6 +665,7 @@ tags:
 - 已确认会话：{stats['sessions']}
 - 精选原话：{stats['quotes']}
 - 选题卡：{stats['topics']}
+- 独立案例：{stats['cases']}
 - 覆盖主题：{len(stats['themes'])}
 
 {chr(10).join(sections)}
@@ -654,6 +690,7 @@ def register_session(store: LibraryStore, state: dict[str, Any], payload: dict[s
     if session["id"] in state["records"]["sessions"]:
         raise LibraryError(f"session already exists: {session['id']}")
     quotes = normalized_quotes(payload, session)
+    cases = normalized_cases(payload, session)
     topics = normalized_topics(payload, session)
     signals = normalized_signals(payload, session)
     records = state["records"]
@@ -667,6 +704,12 @@ def register_session(store: LibraryStore, state: dict[str, Any], payload: dict[s
         quote_id: record["session_id"] for quote_id, record in records["quotes"].items()
     }
     incoming_session_for_quote = {quote["id"]: session["id"] for quote in quotes}
+    for case in cases:
+        unknown = set(case["quote_ids"]) - all_quote_ids
+        if unknown:
+            raise LibraryError(f"case {case['id']} references unknown quotes: {', '.join(sorted(unknown))}")
+        if case["id"] in records["cases"]:
+            raise LibraryError(f"case already exists: {case['id']}")
     for topic in topics:
         unknown = set(topic["quote_ids"]) - all_quote_ids
         if unknown:
@@ -723,6 +766,46 @@ def register_session(store: LibraryStore, state: dict[str, Any], payload: dict[s
             "theme": quote["theme"],
             "source_turn": quote["source_turn"],
             "story_or_decision": quote["story_or_decision"],
+            "created_at": iso_now(),
+        }
+
+    for case in cases:
+        case_path = f"cases/{case['id']}.md"
+        source_session_ids = sorted(
+            {
+                records["quotes"][quote_id]["session_id"]
+                for quote_id in case["quote_ids"]
+                if quote_id in records["quotes"]
+            }
+        )
+        case_text = render_template(
+            "case-template.md",
+            {
+                "case_id": case["id"],
+                "date": session["date"],
+                "theme": case["theme"],
+                "source_sessions_json": json.dumps(source_session_ids, ensure_ascii=False),
+                "title": case["title"],
+                "scene": case["scene"] or "未知，待后续确认",
+                "goal": case["goal"] or "未知，待后续确认",
+                "action": case["action"] or "未知，待后续确认",
+                "obstacle": case["obstacle"] or "未知，待后续确认",
+                "user_action": case["user_action"] or "未知，待后续确认",
+                "result": case["result"] or "未知，待后续确认",
+                "costs": format_list(case["costs"], "- 未确认"),
+                "confirmed_facts": evidence_lines(case["confirmed_fact_quote_ids"], state),
+                "lesson": case["lesson"] or "未提炼",
+                "evidence": evidence_lines(case["quote_ids"], state),
+            },
+        )
+        store.write_text(case_path, case_text)
+        records["cases"][case["id"]] = {
+            "id": case["id"],
+            "path": case_path,
+            "theme": case["theme"],
+            "quote_ids": case["quote_ids"],
+            "confirmed_fact_quote_ids": case["confirmed_fact_quote_ids"],
+            "source_session_ids": source_session_ids,
             "created_at": iso_now(),
         }
 
@@ -821,6 +904,7 @@ def register_session(store: LibraryStore, state: dict[str, Any], payload: dict[s
             "quote_blocks": "\n\n".join(quote_block(quote, index) for index, quote in enumerate(quotes, start=1)),
             "topic_links": format_list(f"[[topics/{topic['id']}|{topic['title']}]]" for topic in topics),
             "signal_links": format_list(f"[[signals/{signal['id']}|{signal['id']}]]" for signal in signals),
+            "case_links": format_list(f"[[cases/{case['id']}|{case['title']}]]" for case in cases),
             "next_threads": format_list(payload.get("next_threads") or []),
         },
     )
@@ -834,6 +918,7 @@ def register_session(store: LibraryStore, state: dict[str, Any], payload: dict[s
         "quote_ids": [quote["id"] for quote in quotes],
         "topic_ids": [topic["id"] for topic in topics],
         "signal_ids": [signal["id"] for signal in signals],
+        "case_ids": [case["id"] for case in cases],
         "created_at": iso_now(),
     }
     return {
@@ -842,6 +927,7 @@ def register_session(store: LibraryStore, state: dict[str, Any], payload: dict[s
         "quotes_registered": len(quotes),
         "topics_registered": len(topics),
         "signals_registered": len(signals),
+        "cases_registered": len(cases),
     }
 
 
@@ -903,6 +989,7 @@ def status_markdown(store: LibraryStore, state: dict[str, Any]) -> str:
 - Quotes: {stats['quotes']}
 - Topics: {stats['topics']}
 - Signals: {stats['signals']}
+- Cases: {stats['cases']}
 - Themes: {len(stats['themes'])}
 - Stories or decisions: {stats['stories_or_decisions']}
 - Voice signals: {stats['voice_signals']} ({', '.join(f"{status}={count}" for status, count in stats['voice_signal_statuses'].items() if count) or 'none'})
@@ -982,6 +1069,13 @@ def cmd_context(args: argparse.Namespace) -> int:
         args.limit,
         {"unfilmed", "drafted"},
     )
+    cases = relevant_records(
+        store,
+        state["records"].get("cases", {}),
+        args.query or "",
+        themes,
+        args.limit,
+    )
     sessions = relevant_records(
         store,
         state["records"]["sessions"],
@@ -1007,11 +1101,15 @@ def cmd_context(args: argparse.Namespace) -> int:
         "",
         "\n\n---\n\n".join(text for _, _, text in topics) or "- None",
         "",
+        "## Relevant independent cases",
+        "",
+        "\n\n---\n\n".join(text for _, _, text in cases) or "- None",
+        "",
         "## Source sessions with exact quotes",
         "",
         "\n\n---\n\n".join(text for _, _, text in sessions) or "- None",
         "",
-        "> Treat exact quotes as source evidence. Do not invent experiences, numbers, clients, or positions.",
+        "> Keep different case_id values separate. Treat confirmed facts and exact quotes as source evidence; treat lessons as inference. Do not invent missing causal steps.",
     ]
     output = "\n".join(chunks) + "\n"
     if args.output:
@@ -1072,12 +1170,15 @@ def feedback_markdown(
     )
     topics = sorted(records["topics"].values(), key=lambda record: record["id"])
     signals = sorted(records["signals"].values(), key=lambda record: record["id"])
+    cases = sorted(records.get("cases", {}).values(), key=lambda record: record["id"])
     quote_counts = [len(record.get("quote_ids", [])) for record in sessions]
     small_sessions = [record for record in sessions if len(record.get("quote_ids", [])) <= 3]
     sessions_with_topics = [record for record in sessions if record.get("topic_ids")]
     sessions_with_signals = [record for record in sessions if record.get("signal_ids")]
     sessions_without_derivatives = [
-        record for record in sessions if not record.get("topic_ids") and not record.get("signal_ids")
+        record
+        for record in sessions
+        if not record.get("topic_ids") and not record.get("signal_ids") and not record.get("case_ids")
     ]
     sessions_per_day = Counter(record.get("date", "unknown") for record in sessions)
     theme_sessions: dict[str, set[str]] = {}
@@ -1097,7 +1198,8 @@ def feedback_markdown(
             "- "
             f"`{record['id']}` · {record.get('date', 'unknown')} · {record.get('mode', 'unknown')} · "
             f"{len(record.get('quote_ids', []))} 原话 · {len(record.get('topic_ids', []))} 选题 · "
-            f"{len(record.get('signal_ids', []))} 信号 · `{record['path']}`"
+            f"{len(record.get('signal_ids', []))} 信号 · {len(record.get('case_ids', []))} 案例 · "
+            f"`{record['path']}`"
         )
     topic_inventory = [
         f"- `{record['id']}` · {record.get('status', 'unknown')} · {record.get('theme') or '无主题'} · "
@@ -1108,6 +1210,12 @@ def feedback_markdown(
         f"- `{record['id']}` · {record.get('type', 'unknown')}/{record.get('status', 'unknown')} · "
         f"{len(record.get('evidence_session_ids', []))} 次会话证据 · `{record['path']}`"
         for record in signals
+    ]
+    case_inventory = [
+        f"- `{record['id']}` · {record.get('theme') or '无主题'} · "
+        f"{len(record.get('quote_ids', []))} 条完整证据 · "
+        f"{len(record.get('confirmed_fact_quote_ids', []))} 条事实证据 · `{record['path']}`"
+        for record in cases
     ]
     checks = "\n".join(
         f"- {name}: {'ready' if ready else 'not ready'}"
@@ -1130,6 +1238,7 @@ def feedback_markdown(
         f"- 精选原话：{stats['quotes']}",
         f"- 轻量选题卡：{stats['topics']}",
         f"- 画像信号：{stats['signals']}",
+        f"- 独立案例卡：{stats['cases']}",
         f"- 覆盖主题：{len(stats['themes'])}",
         f"- 具体故事或决策：{stats['stories_or_decisions']}",
         "",
@@ -1144,7 +1253,7 @@ def feedback_markdown(
         "",
         f"- 已形成选题的会话：{len(sessions_with_topics)} / {len(sessions)}（{percentage(len(sessions_with_topics), len(sessions))}）",
         f"- 已形成画像信号的会话：{len(sessions_with_signals)} / {len(sessions)}（{percentage(len(sessions_with_signals), len(sessions))}）",
-        f"- 尚未形成选题或信号的会话：{len(sessions_without_derivatives)}",
+        f"- 尚未形成选题、信号或案例的会话：{len(sessions_without_derivatives)}",
         f"- 跨会话重复主题：{', '.join(f'{theme}({count})' for theme, count in repeat_themes) or '无'}",
         "",
         "### 可供周期性归并的会话",
@@ -1171,6 +1280,10 @@ def feedback_markdown(
         "",
         "\n".join(signal_inventory) or "- 无",
         "",
+        "## 案例索引",
+        "",
+        "\n".join(case_inventory) or "- 无",
+        "",
         "## 交互反馈待补充",
         "",
         "- 用户确认的个性化表达触发器：待 Agent 从实际试用对话补充，并标注来源会话",
@@ -1190,6 +1303,8 @@ def feedback_markdown(
         redactions += count
         signal_content, count = markdown_asset_section(store, signals)
         redactions += count
+        case_content, count = markdown_asset_section(store, cases)
+        redactions += count
         selected_sessions = list(reversed(sessions))[:session_limit]
         selected_sessions.reverse()
         session_content, count = markdown_asset_section(store, selected_sessions)
@@ -1208,6 +1323,10 @@ def feedback_markdown(
                 "## 已确认画像信号正文",
                 "",
                 signal_content,
+                "",
+                "## 已确认独立案例正文",
+                "",
+                case_content,
                 "",
                 f"## 最近 {len(selected_sessions)} 次会话的已确认资产",
                 "",
@@ -1244,7 +1363,7 @@ def replace_markdown_list_section(text: str, heading: str, lines: Iterable[str])
         re.MULTILINE | re.DOTALL,
     )
     if not pattern.search(text):
-        raise LibraryError(f"session file is missing section: {heading}")
+        return text.rstrip() + f"\n\n## {heading}\n\n{content}\n"
     return pattern.sub(lambda match: f"{match.group(1)}{content}\n\n", text, count=1)
 
 
@@ -1252,6 +1371,7 @@ def rebuild_session_derivative_links(store: LibraryStore, state: dict[str, Any])
     records = state["records"]
     topic_ids_by_session = {session_id: [] for session_id in records["sessions"]}
     signal_ids_by_session = {session_id: [] for session_id in records["sessions"]}
+    case_ids_by_session = {session_id: [] for session_id in records["sessions"]}
     for topic_id, topic in records["topics"].items():
         source_session_ids = session_ids_for_quotes(state, topic.get("quote_ids", []))
         topic["source_session_ids"] = source_session_ids
@@ -1263,14 +1383,25 @@ def rebuild_session_derivative_links(store: LibraryStore, state: dict[str, Any])
         signal["evidence_session_ids"] = source_session_ids
         for session_id in source_session_ids:
             signal_ids_by_session[session_id].append(signal_id)
+    for case_id, case in records.get("cases", {}).items():
+        source_session_ids = session_ids_for_quotes(state, case.get("quote_ids", []))
+        case["source_session_ids"] = source_session_ids
+        for session_id in source_session_ids:
+            case_ids_by_session[session_id].append(case_id)
     for session_id, session in records["sessions"].items():
         topic_ids = sorted(topic_ids_by_session[session_id])
         signal_ids = sorted(signal_ids_by_session[session_id])
+        case_ids = sorted(case_ids_by_session[session_id])
         text = store.read_text(session["path"])
         text = replace_markdown_list_section(
             text,
             "本次生成的选题卡",
             (f"[[topics/{topic_id}|{topic_id}]]" for topic_id in topic_ids),
+        )
+        text = replace_markdown_list_section(
+            text,
+            "本次独立案例",
+            (f"[[cases/{case_id}|{case_id}]]" for case_id in case_ids),
         )
         text = replace_markdown_list_section(
             text,
@@ -1280,13 +1411,16 @@ def rebuild_session_derivative_links(store: LibraryStore, state: dict[str, Any])
         store.write_text(session["path"], text)
         session["topic_ids"] = topic_ids
         session["signal_ids"] = signal_ids
+        session["case_ids"] = case_ids
 
 
 def synthesis_candidate_sessions(state: dict[str, Any], limit: int) -> tuple[list[dict[str, Any]], list[str]]:
     sessions = list(state["records"]["sessions"].values())
     sessions.sort(key=lambda record: (record.get("date", ""), record.get("id", "")), reverse=True)
     without_derivatives = [
-        record for record in sessions if not record.get("topic_ids") and not record.get("signal_ids")
+        record
+        for record in sessions
+        if not record.get("topic_ids") and not record.get("signal_ids") and not record.get("case_ids")
     ]
     theme_sessions: dict[str, set[str]] = {}
     for record in sessions:
@@ -1337,11 +1471,16 @@ def synthesis_context_markdown(
         for record in state["records"]["signals"].values()
         if record.get("theme") in selected_themes and record.get("status") == "tentative"
     ]
+    related_cases = [
+        record
+        for record in state["records"].get("cases", {}).values()
+        if record.get("theme") in selected_themes
+    ]
     candidate_inventory = [
         "- "
         f"`{record['id']}` · {record.get('date', 'unknown')} · "
         f"{len(record.get('quote_ids', []))} 原话 · "
-        f"{'无派生资产' if not record.get('topic_ids') and not record.get('signal_ids') else '重复主题上下文'}"
+        f"{'无派生资产' if not record.get('topic_ids') and not record.get('signal_ids') and not record.get('case_ids') else '重复主题上下文'}"
         for record in selected
     ]
     repeated_theme_lines = [
@@ -1354,6 +1493,9 @@ def synthesis_context_markdown(
     )
     signal_content, _ = markdown_asset_section(
         store, sorted(related_signals, key=lambda record: record["id"])
+    )
+    case_content, _ = markdown_asset_section(
+        store, sorted(related_cases, key=lambda record: record["id"])
     )
     return "\n".join(
         [
@@ -1386,6 +1528,10 @@ def synthesis_context_markdown(
             "",
             signal_content,
             "",
+            "## 相关独立案例",
+            "",
+            case_content,
+            "",
             "## 候选会话与准确原话",
             "",
             session_content,
@@ -1393,6 +1539,7 @@ def synthesis_context_markdown(
             "## Agent 归并要求",
             "",
             "- 只基于本包中的准确原话提出选题和信号，不补写用户没有说过的经历或立场。",
+            "- 不同 case_id 代表不同事件，不得因为主题相似而拼接成同一条经历。",
             "- 优先复用相同含义的已有 signal_id，并补充跨会话证据。",
             "- recurring 必须有至少 3 次不同会话证据；confirmed 必须由用户明确认领。",
             "- 不强求每个候选会话都形成派生资产；审阅卡中列出本次覆盖和跳过的会话。",
@@ -1727,7 +1874,14 @@ def validation_report(store: LibraryStore, state: dict[str, Any]) -> dict[str, A
     sessions = records.get("sessions", {})
     topics = records.get("topics", {})
     signals = records.get("signals", {})
-    for group_name, group in (("sessions", sessions), ("quotes", quotes), ("topics", topics), ("signals", signals)):
+    cases = records.get("cases", {})
+    for group_name, group in (
+        ("sessions", sessions),
+        ("quotes", quotes),
+        ("cases", cases),
+        ("topics", topics),
+        ("signals", signals),
+    ):
         for record_id, record in group.items():
             relative = record.get("path")
             if not relative:
@@ -1751,6 +1905,19 @@ def validation_report(store: LibraryStore, state: dict[str, Any]) -> dict[str, A
         indexed_sessions = set(topic.get("source_session_ids", []))
         if indexed_sessions and indexed_sessions != expected_sessions:
             errors.append(f"topic {topic_id} source_session_ids differ from quote evidence")
+    for case_id, case in cases.items():
+        unknown = set(case.get("quote_ids", [])) - set(quotes)
+        if unknown:
+            errors.append(f"case {case_id} references missing quotes: {', '.join(sorted(unknown))}")
+        facts_outside = set(case.get("confirmed_fact_quote_ids", [])) - set(case.get("quote_ids", []))
+        if facts_outside:
+            errors.append(
+                f"case {case_id} confirmed facts are outside case evidence: "
+                f"{', '.join(sorted(facts_outside))}"
+            )
+        expected_sessions = set(session_ids_for_quotes(state, case.get("quote_ids", [])))
+        if set(case.get("source_session_ids", [])) != expected_sessions:
+            errors.append(f"case {case_id} source_session_ids differ from quote evidence")
     for signal_id, signal in signals.items():
         if signal.get("status") not in SIGNAL_STATUSES:
             errors.append(f"signal {signal_id} has invalid status {signal.get('status')}")
@@ -1777,10 +1944,17 @@ def validation_report(store: LibraryStore, state: dict[str, Any]) -> dict[str, A
             for signal_id, signal in signals.items()
             if session_id in session_ids_for_quotes(state, signal.get("evidence_quote_ids", []))
         }
+        expected_cases = {
+            case_id
+            for case_id, case in cases.items()
+            if session_id in session_ids_for_quotes(state, case.get("quote_ids", []))
+        }
         if set(session.get("topic_ids", [])) != expected_topics:
             errors.append(f"session {session_id} topic_ids differ from quote evidence")
         if set(session.get("signal_ids", [])) != expected_signals:
             errors.append(f"session {session_id} signal_ids differ from quote evidence")
+        if set(session.get("case_ids", [])) != expected_cases:
+            errors.append(f"session {session_id} case_ids differ from quote evidence")
     for batch_id, batch in state.get("synthesis_batches", {}).items():
         unknown_sessions = set(batch.get("source_session_ids", [])) - set(sessions)
         unknown_topics = set(batch.get("topic_ids", [])) - set(topics)
@@ -1849,6 +2023,7 @@ def find_forget_impact(state: dict[str, Any], store: LibraryStore, args: argpars
     quotes_to_delete = set(args.quote_id or [])
     topics_to_delete = set(args.topic_id or [])
     signals_to_delete = set(args.signal_id or [])
+    cases_to_delete = set(args.case_id or [])
     contains = (args.contains or "").casefold().strip()
     if contains:
         for session_id, record in records["sessions"].items():
@@ -1867,11 +2042,15 @@ def find_forget_impact(state: dict[str, Any], store: LibraryStore, args: argpars
         for signal_id, record in records["signals"].items():
             if contains in store.read_text(record["path"]).casefold():
                 signals_to_delete.add(signal_id)
+        for case_id, record in records.get("cases", {}).items():
+            if contains in store.read_text(record["path"]).casefold():
+                cases_to_delete.add(case_id)
     unknown = {
         "sessions": sessions_to_delete - set(records["sessions"]),
         "quotes": quotes_to_delete - set(records["quotes"]),
         "topics": topics_to_delete - set(records["topics"]),
         "signals": signals_to_delete - set(records["signals"]),
+        "cases": cases_to_delete - set(records.get("cases", {})),
     }
     unknown = {key: sorted(value) for key, value in unknown.items() if value}
     if unknown:
@@ -1902,11 +2081,15 @@ def find_forget_impact(state: dict[str, Any], store: LibraryStore, args: argpars
                 signals_to_update[signal_id] = remaining
             else:
                 signals_to_delete.add(signal_id)
+    for case_id, case in records.get("cases", {}).items():
+        if set(case.get("quote_ids", [])) & quotes_to_delete:
+            cases_to_delete.add(case_id)
     return {
         "sessions_to_delete": sorted(sessions_to_delete),
         "quotes_to_delete": sorted(quotes_to_delete),
         "topics_to_delete": sorted(topics_to_delete),
         "signals_to_delete": sorted(signals_to_delete),
+        "cases_to_delete": sorted(cases_to_delete),
         "topics_to_update": topics_to_update,
         "signals_to_update": signals_to_update,
     }
@@ -1918,6 +2101,7 @@ def apply_forget(store: LibraryStore, state: dict[str, Any], impact: dict[str, A
     quotes_to_delete = set(impact["quotes_to_delete"])
     topics_to_delete = set(impact["topics_to_delete"])
     signals_to_delete = set(impact["signals_to_delete"])
+    cases_to_delete = set(impact["cases_to_delete"])
 
     for session_id, session in list(records["sessions"].items()):
         if session_id in sessions_to_delete:
@@ -1925,14 +2109,20 @@ def apply_forget(store: LibraryStore, state: dict[str, Any], impact: dict[str, A
             records["sessions"].pop(session_id, None)
             continue
         removed_here = set(session.get("quote_ids", [])) & quotes_to_delete
-        if removed_here or topics_to_delete or signals_to_delete:
+        if removed_here or topics_to_delete or signals_to_delete or cases_to_delete:
             text = store.read_text(session["path"])
             text = remove_quote_blocks(text, removed_here)
-            text = remove_lines_containing(text, topics_to_delete | signals_to_delete)
+            text = remove_lines_containing(text, topics_to_delete | signals_to_delete | cases_to_delete)
             store.write_text(session["path"], text)
             session["quote_ids"] = [value for value in session.get("quote_ids", []) if value not in quotes_to_delete]
             session["topic_ids"] = [value for value in session.get("topic_ids", []) if value not in topics_to_delete]
             session["signal_ids"] = [value for value in session.get("signal_ids", []) if value not in signals_to_delete]
+            session["case_ids"] = [value for value in session.get("case_ids", []) if value not in cases_to_delete]
+
+    for case_id, case in list(records.get("cases", {}).items()):
+        if case_id in cases_to_delete:
+            store.remove(case["path"])
+            records["cases"].pop(case_id, None)
 
     for topic_id, topic in list(records["topics"].items()):
         if topic_id in topics_to_delete:
@@ -2083,6 +2273,7 @@ def build_parser() -> argparse.ArgumentParser:
     forget_parser.add_argument("--session-id", action="append")
     forget_parser.add_argument("--topic-id", action="append")
     forget_parser.add_argument("--signal-id", action="append")
+    forget_parser.add_argument("--case-id", action="append")
     forget_parser.add_argument("--contains")
     action = forget_parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--dry-run", action="store_true")
@@ -2106,7 +2297,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.payload and args.output:
             parser.error("synthesize --output cannot be used with --payload")
     if args.command == "forget" and not any(
-        [args.quote_id, args.session_id, args.topic_id, args.signal_id, args.contains]
+        [args.quote_id, args.session_id, args.topic_id, args.signal_id, args.case_id, args.contains]
     ):
         parser.error("forget requires at least one target selector")
     try:

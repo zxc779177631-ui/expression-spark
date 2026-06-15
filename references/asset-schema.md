@@ -25,6 +25,23 @@
       "story_or_decision": true
     }
   ],
+  "cases": [
+    {
+      "id": "case-client-choice",
+      "title": "主动拒绝一个反复改变交付边界的大客户",
+      "scene": "一次项目沟通后",
+      "goal": "判断是否继续合作",
+      "action": "复盘客户多次临时改变边界的记录",
+      "obstacle": "短期收入很有吸引力",
+      "user_action": "决定拒绝继续合作",
+      "result": "停止合作",
+      "costs": ["放弃短期收入"],
+      "lesson": "可控的交付边界比短期收入更重要。",
+      "quote_ids": ["q-20260613-01"],
+      "confirmed_fact_quote_ids": ["q-20260613-01"],
+      "theme": "客户选择"
+    }
+  ],
   "topics": [
     {
       "id": "topic-client-choice",
@@ -60,6 +77,7 @@
 | `confirmed` | 是 | 必须为 `true`，否则脚本拒绝登记 |
 | `session` | 是 | 本次已确认素材的会话元数据 |
 | `quotes` | 是 | 精选原话，不是完整聊天记录 |
+| `cases` | 否 | 独立案例卡；事实与推断分层，并保持事件边界 |
 | `topics` | 否 | 1–3 张轻量选题卡 |
 | `signals` | 否 | 证据化画像信号 |
 | `next_threads` | 否 | 下次可继续的具体话头 |
@@ -116,6 +134,11 @@
 - 完整连续片段仍是精选原话，不包含 Agent 问句、无关对话或完整聊天记录。
 - 选题和信号必须引用真实原话 ID。
 - 同一信号增加证据时复用相同 `signal.id`；不要创建多个近义信号来虚增重复模式。
+- 每个独立事件使用不同 `case.id`。相似主题、相同观点或同一工具不构成合并依据。
+- `case.quote_ids` 保存完整案例证据；`confirmed_fact_quote_ids` 必须是其子集。
+- `scene`、`goal`、`action`、`obstacle`、`user_action`、`result` 或 `costs` 不确定时留空，不得补写。
+- `lesson` 是派生推断，不等同于事实；下游必须以原话和已确认事实为准。
+- 遗忘任一案例证据时，脚本保守删除该案例卡，避免残留摘要继续传播已遗忘信息。
 
 ## 周期归并 Payload
 

@@ -110,6 +110,7 @@ git clone https://github.com/zxc779177631-ui/expression-spark.git \
 ```text
 config.md
 sessions/YYYY/MM/<session-id>.md
+cases/<case-id>.md
 topics/<topic-id>.md
 signals/<signal-id>.md
 profile/current.md
